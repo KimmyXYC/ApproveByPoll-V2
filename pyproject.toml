@@ -18,7 +18,8 @@ dependencies = [
     "dynaconf>=3.2.4",
     "pre-commit>=3.5.0",
     "frozenlist>=1.3.4",
-    "pysocks>=1.7.1"
+    "pysocks>=1.7.1",
+    "asyncpg>=0.31.0",
 ]
 
 
