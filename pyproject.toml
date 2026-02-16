@@ -1,9 +1,9 @@
 [project]
-name = ""
-version = ""
-description = ""
+name = "ApproveByPoll"
+version = "2.0.0"
+description = "Telegram group joining bot with voting feature."
 authors = [
-    { name = "github", email = "none@none.none" },
+    { name = "KimmyXYC", email = "kimmyxyc@nepnep.moe" },
 ]
 dependencies = [
     "pydantic<3.0.0,>=2.0.0",
@@ -22,10 +22,18 @@ dependencies = [
 
 
 
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 
+[tool.setuptools]
+packages = ["app", "setting", "conf_dir"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
