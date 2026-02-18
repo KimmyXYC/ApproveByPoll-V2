@@ -50,6 +50,9 @@ class BotRunner(object):
         else:
             logger.info("🌐 使用官方 Bot API 服务器")
 
+        if not BotSetting.token:
+            raise ValueError("TELEGRAM_BOT_TOKEN is required")
+
         self.bot = AsyncTeleBot(BotSetting.token, state_storage=StepCache)
         self.join_request_store = JoinRequestSessionStore()
 
@@ -86,8 +89,17 @@ class BotRunner(object):
         async def listen_setting_command(message: types.Message):
             await open_settings(bot, message)
 
+        @bot.message_handler(
+            content_types=["pinned_message"], chat_types=["group", "supergroup"]
+        )
+        async def listen_pinned_service_message(message: types.Message):
+            await event.listen_pinned_service_message(bot, message)
+
         @bot.callback_query_handler(func=lambda call: bool(call.data))
         async def listen_callback_query(call: types.CallbackQuery):
+            if not call.data:
+                return
+
             if call.data.startswith("setting "):
                 await handle_settings_callback(bot, call)
                 return

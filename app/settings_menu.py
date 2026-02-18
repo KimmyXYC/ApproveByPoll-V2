@@ -30,6 +30,32 @@ async def _can_change_group_info(bot, chat_id: int, user_id: int) -> bool:
     return bool(getattr(member, "can_change_info", False))
 
 
+async def _bot_can_delete_messages(bot, chat_id: int) -> bool:
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+        if bot_member.status == "creator":
+            return True
+        if bot_member.status != "administrator":
+            return False
+        return bool(getattr(bot_member, "can_delete_messages", False))
+    except Exception:
+        return False
+
+
+async def _bot_can_pin_messages(bot, chat_id: int) -> bool:
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+        if bot_member.status == "creator":
+            return True
+        if bot_member.status != "administrator":
+            return False
+        return bool(getattr(bot_member, "can_pin_messages", False))
+    except Exception:
+        return False
+
+
 def _format_vote_time(language: str, seconds: int) -> str:
     minutes = max(seconds // 60, 1)
     return t(language, "setting_vote_minutes", minutes=minutes)
@@ -53,30 +79,45 @@ def _build_settings_text(group_settings: dict) -> str:
 def build_main_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup:
     language = normalize_language_code(group_settings.get("language"))
     group_id = group_settings["group_id"]
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
 
+    vote_to_join = bool(group_settings.get("vote_to_join", True))
+    vote_to_join_icon = "✅" if vote_to_join else "❌"
+    keyboard.add(
+        types.InlineKeyboardButton(
+            f"{vote_to_join_icon} {t(language, 'setting_vote_to_join')}",
+            callback_data=f"setting {group_id} vote_to_join {str(not vote_to_join).lower()}",
+        )
+    )
+
+    two_column_buttons = []
     for item in TOGGLE_ITEMS:
+        if item == "vote_to_join":
+            continue
         current_value = bool(group_settings.get(item, False))
         icon = "✅" if current_value else "❌"
-        keyboard.add(
+        two_column_buttons.append(
             types.InlineKeyboardButton(
                 f"{icon} {t(language, f'setting_{item}')}",
                 callback_data=f"setting {group_id} {item} {str(not current_value).lower()}",
             )
         )
 
-    keyboard.add(
-        types.InlineKeyboardButton(
-            f"⏱️ {t(language, 'setting_vote_time')}",
-            callback_data=f"setting {group_id} vote_time menu",
-        )
+    two_column_buttons.extend(
+        [
+            types.InlineKeyboardButton(
+                f"⏱️ {t(language, 'setting_vote_time')}",
+                callback_data=f"setting {group_id} vote_time menu",
+            ),
+            types.InlineKeyboardButton(
+                f"🌐 {t(language, 'setting_language')}",
+                callback_data=f"setting {group_id} language menu",
+            ),
+        ]
     )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            f"🌐 {t(language, 'setting_language')}",
-            callback_data=f"setting {group_id} language menu",
-        )
-    )
+
+    keyboard.add(*two_column_buttons)
+
     keyboard.add(
         types.InlineKeyboardButton(
             f"✖️ {t(language, 'setting_close')}",
@@ -142,6 +183,8 @@ def build_language_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup:
 async def open_settings(bot, message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
+    if not message.from_user:
+        return
 
     group_settings = await BotDatabase.get_group_settings(message.chat.id)
     language = normalize_language_code(group_settings.get("language"))
@@ -160,7 +203,7 @@ async def open_settings(bot, message: types.Message):
 
 
 async def handle_settings_callback(bot, call: types.CallbackQuery):
-    if not call.message or not call.data:
+    if not call.message or not call.data or not call.from_user:
         return
 
     parts = call.data.split(" ")
@@ -255,6 +298,27 @@ async def handle_settings_callback(bot, call: types.CallbackQuery):
                 callback_query_id=call.id, text="Invalid value"
             )
             return
+
+        if item == "clean_pinned_message" and bool_value:
+            can_delete = await _bot_can_delete_messages(bot, group_id)
+            if not can_delete:
+                await bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text=t(language, "insufficient_permissions"),
+                    show_alert=True,
+                )
+                return
+
+        if item == "pin_msg" and bool_value:
+            can_pin = await _bot_can_pin_messages(bot, group_id)
+            if not can_pin:
+                await bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text=t(language, "insufficient_permissions"),
+                    show_alert=True,
+                )
+                return
+
         await BotDatabase.update_group_setting(
             group_id=group_id, item=item, value=bool_value
         )

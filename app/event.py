@@ -6,7 +6,9 @@
 from telebot import formatting, types
 
 from app.settings_menu import handle_settings_callback, open_settings
+from setting.telegrambot import BotSetting
 from utils.i18n import t
+from utils.postgres import BotDatabase
 
 
 async def set_bot_commands(bot):
@@ -32,3 +34,35 @@ async def listen_help_command(bot, message: types.Message):
         ),
         parse_mode="MarkdownV2",
     )
+
+
+async def listen_setting_command(bot, message: types.Message):
+    await open_settings(bot, message)
+
+
+async def listen_setting_callback(bot, call: types.CallbackQuery):
+    await handle_settings_callback(bot, call)
+
+
+async def listen_pinned_service_message(bot, message: types.Message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    if not message.from_user:
+        return
+
+    bot_id = int(BotSetting.bot_id) if BotSetting.bot_id else None
+    if bot_id is None:
+        me = await bot.get_me()
+        bot_id = me.id
+
+    if message.from_user.id != bot_id:
+        return
+
+    group_settings = await BotDatabase.get_group_settings(message.chat.id)
+    if not group_settings.get("clean_pinned_message", False):
+        return
+
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception:
+        return

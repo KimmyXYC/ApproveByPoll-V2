@@ -99,11 +99,14 @@ class JoinRequestVote:
     async def _notify_applicant(self, text_key: str):
         if not self.message3:
             return
-        await self.bot.send_message(
-            chat_id=self.user_id,
-            text=t(self.language, text_key),
-            reply_to_message_id=self.message3.message_id,
-        )
+        try:
+            await self.bot.send_message(
+                chat_id=self.user_id,
+                text=t(self.language, text_key),
+                reply_to_message_id=self.message3.message_id,
+            )
+        except Exception:
+            return
 
     async def run(self):
         applicant = self.request.from_user
