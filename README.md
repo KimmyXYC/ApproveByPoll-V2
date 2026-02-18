@@ -126,6 +126,36 @@ docker compose logs -f bot
 docker compose down
 ```
 
+## Systemd Service
+
+This repo provides a ready-to-use unit file: `approvebypoll.service`.
+
+1. Prepare runtime files first:
+   - `.env`
+   - `conf_dir/.secrets.toml`
+   - `conf_dir/settings.toml`
+2. Create a dedicated Linux user (recommended).
+3. Put the project at `/opt/ApproveByPoll-V2` (or adjust paths in the unit file).
+4. Ensure virtualenv exists at `/opt/ApproveByPoll-V2/.venv`.
+
+Install and enable:
+
+```bash
+sudo cp approvebypoll.service /etc/systemd/system/approvebypoll.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now approvebypoll
+```
+
+Manage service:
+
+```bash
+sudo systemctl status approvebypoll
+sudo systemctl restart approvebypoll
+sudo journalctl -u approvebypoll -f
+```
+
+If your deployment path or Python path differs, edit `WorkingDirectory` and `ExecStart` in `approvebypoll.service`.
+
 ## GitHub Container Registry (GHCR)
 
 This repo includes a workflow to auto-build and push Docker images to GHCR.

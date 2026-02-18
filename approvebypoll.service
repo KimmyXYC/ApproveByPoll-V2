@@ -1,0 +1,21 @@
+[Unit]
+Description=ApproveByPoll Telegram Bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=approvebypoll
+Group=approvebypoll
+WorkingDirectory=/opt/ApproveByPoll-V2
+EnvironmentFile=/opt/ApproveByPoll-V2/.env
+ExecStart=/usr/local/bin/pdm run python main.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=approvebypoll
+
+[Install]
+WantedBy=multi-user.target
