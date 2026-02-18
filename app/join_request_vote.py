@@ -265,6 +265,13 @@ class JoinRequestVote:
         except Exception:
             return
 
+    def _status_label(self, waiting: bool, result: bool | None) -> str:
+        if waiting:
+            return t(self.language, "jr_status_pending_label")
+        if result is True:
+            return t(self.language, "jr_status_approve_label")
+        return t(self.language, "jr_status_reject_label")
+
     async def run(self):
         applicant = self.request.from_user
         applicant_display = self._user_display(applicant)
@@ -404,6 +411,13 @@ class JoinRequestVote:
                 pass
 
         try:
+            status_keyboard = types.InlineKeyboardMarkup(row_width=1)
+            status_keyboard.add(
+                types.InlineKeyboardButton(
+                    text=t(self.language, "jr_check_status"),
+                    callback_data=f"jrs {self.uuid}",
+                )
+            )
             self.message3 = await self.bot.send_message(
                 chat_id=self.user_id,
                 text=t(
@@ -412,6 +426,7 @@ class JoinRequestVote:
                     group_name=self.request.chat.title,
                     vote_minutes=self._vote_minutes(),
                 ),
+                reply_markup=status_keyboard,
             )
             logger.debug(
                 "message3 sent to applicant uuid={} user_id={} message_id={}",
@@ -746,3 +761,30 @@ class JoinRequestVote:
                 )
 
         await self.bot.reply_to(message, text)
+
+    async def handle_status_query(self, call: types.CallbackQuery):
+        if call.from_user.id != self.user_id:
+            await self.bot.answer_callback_query(
+                callback_query_id=call.id,
+                text=t(self.language, "insufficient_permissions"),
+                show_alert=True,
+            )
+            return
+
+        status = await BotDatabase.get_join_request_status_by_uuid(self.uuid)
+        if status is None:
+            await self.bot.answer_callback_query(
+                callback_query_id=call.id,
+                text="Expired",
+            )
+            return
+
+        label = self._status_label(
+            waiting=bool(status.get("waiting", False)),
+            result=status.get("result"),
+        )
+        await self.bot.answer_callback_query(
+            callback_query_id=call.id,
+            text=t(self.language, "jr_status_query", status=label),
+            show_alert=True,
+        )

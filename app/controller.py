@@ -18,6 +18,7 @@ from app_conf import settings
 from app import event
 from app.utils import generate_uuid
 from app.settings_menu import handle_settings_callback, open_settings
+from utils.i18n import normalize_language_code, t
 from utils.join_request_store import JoinRequestSessionStore
 from utils.postgres import BotDatabase
 
@@ -152,6 +153,54 @@ class BotRunner(object):
                     )
                     return
                 await instance.handle_vote(call, option)
+                return
+
+            if call.data.startswith("jrs "):
+                parts = call.data.split(" ")
+                if len(parts) != 2:
+                    await bot.answer_callback_query(
+                        callback_query_id=call.id,
+                        text="Invalid callback",
+                    )
+                    return
+                _, request_uuid = parts
+                instance = await self.join_request_store.get(request_uuid)
+                if instance is not None:
+                    await instance.handle_status_query(call)
+                    return
+
+                status = await BotDatabase.get_join_request_status_by_uuid(request_uuid)
+                if status is None:
+                    await bot.answer_callback_query(
+                        callback_query_id=call.id,
+                        text="Expired",
+                    )
+                    return
+
+                if status.get("user_id") != call.from_user.id:
+                    await bot.answer_callback_query(
+                        callback_query_id=call.id,
+                        text="Insufficient permissions.",
+                        show_alert=True,
+                    )
+                    return
+
+                group_settings = await BotDatabase.get_group_settings(
+                    status["group_id"]
+                )
+                language = normalize_language_code(group_settings.get("language"))
+                if status.get("waiting"):
+                    label = t(language, "jr_status_pending_label")
+                elif status.get("result") is True:
+                    label = t(language, "jr_status_approve_label")
+                else:
+                    label = t(language, "jr_status_reject_label")
+
+                await bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text=t(language, "jr_status_query", status=label),
+                    show_alert=True,
+                )
                 return
 
             await bot.answer_callback_query(

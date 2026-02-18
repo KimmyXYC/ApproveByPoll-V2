@@ -274,6 +274,30 @@ class AsyncPostgresDB:
             logger.error(f"Error querying waiting status for uuid={uuid}: {str(e)}")
             raise
 
+    async def get_join_request_status_by_uuid(self, uuid: str) -> dict | None:
+        """
+        Query join_request by uuid and return basic status info.
+        Returns None if the row does not exist.
+        """
+        try:
+            async with self.conn.acquire() as connection:
+                row = await connection.fetchrow(
+                    """
+                    SELECT uuid, group_id, user_id, waiting, result
+                    FROM join_request
+                    WHERE uuid = $1
+                    """,
+                    uuid,
+                )
+                if row is None:
+                    return None
+                return dict(row)
+        except Exception as e:
+            logger.error(
+                f"Error querying join request status for uuid={uuid}: {str(e)}"
+            )
+            raise
+
     async def update_group_setting(self, group_id: int, item: str, value) -> bool:
         """
         Update one allowed group setting field.
