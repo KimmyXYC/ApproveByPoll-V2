@@ -3,6 +3,7 @@ import html
 
 from telebot import types
 
+from app_conf import settings
 from setting.telegrambot import BotSetting
 from utils.i18n import t
 from utils.postgres import BotDatabase
@@ -26,6 +27,7 @@ class JoinRequestVote:
         self._vote_lock = asyncio.Lock()
         self._yes_voters: dict[int, str] = {}
         self._no_voters: dict[int, str] = {}
+        self.log_message_id: int | None = None
 
     @property
     def chat_id(self) -> int:
@@ -41,6 +43,9 @@ class JoinRequestVote:
         full_name = html.escape(user.full_name)
         return f'<a href="tg://user?id={user.id}">{full_name}</a>'
 
+    def _user_full_name_link(self, user_id: int, full_name: str) -> str:
+        return f'<a href="tg://user?id={user_id}">{html.escape(full_name)}</a>'
+
     def _admin_display(self, user: types.User) -> str:
         if user.username:
             return f"@{user.username}"
@@ -49,6 +54,87 @@ class JoinRequestVote:
     def _vote_minutes(self) -> int:
         minutes = self.vote_time // 60
         return max(minutes, 1)
+
+    def _build_log_text(
+        self,
+        status: str,
+        yes_votes: int | None = None,
+        no_votes: int | None = None,
+        admin_id: int | None = None,
+        admin_name: str | None = None,
+    ) -> str:
+        applicant = self.request.from_user
+        lines = [
+            f"<b>Chat:</b> {html.escape(self.request.chat.title or str(self.request.chat.id))}",
+            f"<b>User:</b> {self._user_full_name_link(applicant.id, applicant.full_name)}",
+            f"<b>User ID:</b> <code>{applicant.id}</code>",
+            f"<b>Status:</b> {status}",
+        ]
+        if yes_votes is not None and no_votes is not None:
+            lines.append(f"<b>Result:</b> Allow : Deny = {yes_votes} : {no_votes}")
+        if admin_id is not None and admin_name:
+            lines.append(
+                f"<b>Admin:</b> {self._user_full_name_link(admin_id, admin_name)}"
+            )
+        return "\n".join(lines)
+
+    def _log_channel_config(self) -> tuple[bool, int | None, int | None]:
+        enabled = bool(settings.get("logchannel.enable", False))
+        channel_id = settings.get("logchannel.channel_id", None)
+        thread_id = settings.get("logchannel.message_thread_id", None)
+
+        channel_id_value = int(channel_id) if channel_id is not None else None
+        thread_id_value = int(thread_id) if thread_id is not None else None
+        return enabled, channel_id_value, thread_id_value
+
+    async def _send_pending_log(self):
+        enabled, channel_id, thread_id = self._log_channel_config()
+        if not enabled or channel_id is None:
+            return
+
+        kwargs = {
+            "chat_id": channel_id,
+            "text": self._build_log_text(status="Pending"),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if thread_id is not None and thread_id != 0:
+            kwargs["message_thread_id"] = thread_id
+
+        try:
+            message = await self.bot.send_message(**kwargs)
+            self.log_message_id = message.message_id
+        except Exception:
+            self.log_message_id = None
+
+    async def _edit_log_result(
+        self,
+        status: str,
+        yes_votes: int | None = None,
+        no_votes: int | None = None,
+        admin_id: int | None = None,
+        admin_name: str | None = None,
+    ):
+        enabled, channel_id, _ = self._log_channel_config()
+        if not enabled or channel_id is None or self.log_message_id is None:
+            return
+
+        try:
+            await self.bot.edit_message_text(
+                chat_id=channel_id,
+                message_id=self.log_message_id,
+                text=self._build_log_text(
+                    status=status,
+                    yes_votes=yes_votes,
+                    no_votes=no_votes,
+                    admin_id=admin_id,
+                    admin_name=admin_name,
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            return
 
     async def _safe_delete_message(self, chat_id: int, message_id: int | None):
         if not message_id:
@@ -175,6 +261,7 @@ class JoinRequestVote:
             parse_mode="HTML",
             reply_markup=keyboard,
         )
+        await self._send_pending_log()
 
         if self.group_settings.get("advanced_vote", False):
             self.message2 = await self.bot.send_message(
@@ -284,6 +371,11 @@ class JoinRequestVote:
                 no_votes=no_votes,
             )
             await self._apply_join_result(False)
+            await self._edit_log_result(
+                status="Denied",
+                yes_votes=yes_votes,
+                no_votes=no_votes,
+            )
         else:
             if yes_votes > no_votes:
                 status_key = "jr_status_approved"
@@ -319,6 +411,11 @@ class JoinRequestVote:
                 no_votes=no_votes,
             )
             await self._apply_join_result(approved)
+            await self._edit_log_result(
+                status="Approved" if approved else "Denied",
+                yes_votes=yes_votes,
+                no_votes=no_votes,
+            )
 
         await asyncio.sleep(60)
         if self.message2:
@@ -362,6 +459,11 @@ class JoinRequestVote:
             )
             await self._apply_join_result(True)
             await self._notify_applicant("jr_private_approved")
+            await self._edit_log_result(
+                status="Approved",
+                admin_id=call.from_user.id,
+                admin_name=call.from_user.full_name,
+            )
         elif action == "reject":
             await BotDatabase.update_join_request(
                 uuid=self.uuid,
@@ -376,6 +478,11 @@ class JoinRequestVote:
             )
             await self._apply_join_result(False)
             await self._notify_applicant("jr_private_rejected")
+            await self._edit_log_result(
+                status="Denied",
+                admin_id=call.from_user.id,
+                admin_name=call.from_user.full_name,
+            )
         elif action == "ban":
             await BotDatabase.update_join_request(
                 uuid=self.uuid,
@@ -391,6 +498,11 @@ class JoinRequestVote:
             await self._apply_join_result(False)
             await self.bot.ban_chat_member(chat_id=self.chat_id, user_id=self.user_id)
             await self._notify_applicant("jr_private_rejected")
+            await self._edit_log_result(
+                status="Denied",
+                admin_id=call.from_user.id,
+                admin_name=call.from_user.full_name,
+            )
         else:
             await self.bot.answer_callback_query(
                 callback_query_id=call.id,
