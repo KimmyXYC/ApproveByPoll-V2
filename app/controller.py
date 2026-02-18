@@ -83,6 +83,17 @@ class BotRunner(object):
 
         @bot.message_handler(commands=["start", "help"], chat_types=["private"])
         async def listen_help_command(message: types.Message):
+            message_text = (message.text or "").strip()
+            if message_text.startswith("/start jrres_"):
+                parts = message_text.split(" ", 1)
+                if len(parts) == 2 and parts[1].startswith("jrres_"):
+                    request_uuid = parts[1][6:]
+                    instance = await self.join_request_store.get(request_uuid)
+                    if instance is None:
+                        await bot.reply_to(message, "Expired")
+                        return
+                    await instance.handle_realtime_result_request(message)
+                    return
             await event.listen_help_command(bot, message)
 
         @bot.message_handler(commands=["setting"], chat_types=["group", "supergroup"])
@@ -121,6 +132,25 @@ class BotRunner(object):
                     )
                     return
                 await instance.handle_action(call, action)
+                return
+
+            if call.data.startswith("jrv "):
+                parts = call.data.split(" ")
+                if len(parts) != 3:
+                    await bot.answer_callback_query(
+                        callback_query_id=call.id,
+                        text="Invalid callback",
+                    )
+                    return
+                _, request_uuid, option = parts
+                instance = await self.join_request_store.get(request_uuid)
+                if instance is None:
+                    await bot.answer_callback_query(
+                        callback_query_id=call.id,
+                        text="Expired",
+                    )
+                    return
+                await instance.handle_vote(call, option)
                 return
 
             await bot.answer_callback_query(

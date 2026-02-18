@@ -3,6 +3,7 @@ import html
 
 from telebot import types
 
+from setting.telegrambot import BotSetting
 from utils.i18n import t
 from utils.postgres import BotDatabase
 
@@ -22,6 +23,9 @@ class JoinRequestVote:
         self.message3 = None
         self.message4 = None
         self._manual_resolved = asyncio.Event()
+        self._vote_lock = asyncio.Lock()
+        self._yes_voters: dict[int, str] = {}
+        self._no_voters: dict[int, str] = {}
 
     @property
     def chat_id(self) -> int:
@@ -55,6 +59,8 @@ class JoinRequestVote:
             return
 
     async def _safe_stop_poll(self):
+        if self.group_settings.get("advanced_vote", False):
+            return None
         if not self.message2:
             return None
         try:
@@ -84,6 +90,40 @@ class JoinRequestVote:
         if member.status != "administrator":
             return False
         return bool(getattr(member, "can_invite_users", False))
+
+    async def _is_group_member(self, user_id: int) -> bool:
+        member = await self.bot.get_chat_member(chat_id=self.chat_id, user_id=user_id)
+        return member.status not in {"left", "kicked"}
+
+    async def _get_bot_username(self) -> str:
+        if BotSetting.bot_username:
+            return BotSetting.bot_username
+        me = await self.bot.get_me()
+        return me.username
+
+    def _has_voted(self, user_id: int) -> bool:
+        return user_id in self._yes_voters or user_id in self._no_voters
+
+    async def _build_advanced_vote_keyboard(self) -> types.InlineKeyboardMarkup:
+        bot_username = await self._get_bot_username()
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=t(self.language, "jr_poll_yes"),
+                callback_data=f"jrv {self.uuid} yes",
+            ),
+            types.InlineKeyboardButton(
+                text=t(self.language, "jr_poll_no"),
+                callback_data=f"jrv {self.uuid} no",
+            ),
+        )
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=t(self.language, "jr_live_result"),
+                url=f"https://t.me/{bot_username}?start=jrres_{self.uuid}",
+            )
+        )
+        return keyboard
 
     async def _refresh_message1(self, key: str, **kwargs):
         if not self.message1:
@@ -136,18 +176,27 @@ class JoinRequestVote:
             reply_markup=keyboard,
         )
 
-        self.message2 = await self.bot.send_poll(
-            chat_id=self.chat_id,
-            question=t(self.language, "jr_poll_question"),
-            options=[
-                t(self.language, "jr_poll_yes"),
-                t(self.language, "jr_poll_no"),
-            ],
-            is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
-            protect_content=True,
-            allow_multiple_answers=False,
-            reply_to_message_id=self.message1.message_id,
-        )
+        if self.group_settings.get("advanced_vote", False):
+            self.message2 = await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=t(self.language, "jr_poll_question"),
+                reply_to_message_id=self.message1.message_id,
+                reply_markup=await self._build_advanced_vote_keyboard(),
+                protect_content=True,
+            )
+        else:
+            self.message2 = await self.bot.send_poll(
+                chat_id=self.chat_id,
+                question=t(self.language, "jr_poll_question"),
+                options=[
+                    t(self.language, "jr_poll_yes"),
+                    t(self.language, "jr_poll_no"),
+                ],
+                is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
+                protect_content=True,
+                allow_multiple_answers=False,
+                reply_to_message_id=self.message1.message_id,
+            )
 
         if self.group_settings.get("pin_msg", False):
             try:
@@ -179,20 +228,39 @@ class JoinRequestVote:
         if waiting is not True:
             return
 
-        poll_result = await self._safe_stop_poll()
         yes_votes = 0
         no_votes = 0
+        if self.group_settings.get("advanced_vote", False):
+            async with self._vote_lock:
+                yes_votes = len(self._yes_voters)
+                no_votes = len(self._no_voters)
+            if self.message2:
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=self.message2.message_id,
+                        text=t(
+                            self.language,
+                            "jr_final_votes",
+                            yes_votes=yes_votes,
+                            no_votes=no_votes,
+                        ),
+                    )
+                except Exception:
+                    pass
+        else:
+            poll_result = await self._safe_stop_poll()
 
-        if poll_result and poll_result.options and len(poll_result.options) >= 2:
-            yes_votes = int(poll_result.options[0].voter_count)
-            no_votes = int(poll_result.options[1].voter_count)
-        elif (
-            self.message2
-            and self.message2.poll
-            and len(self.message2.poll.options) >= 2
-        ):
-            yes_votes = int(self.message2.poll.options[0].voter_count)
-            no_votes = int(self.message2.poll.options[1].voter_count)
+            if poll_result and poll_result.options and len(poll_result.options) >= 2:
+                yes_votes = int(poll_result.options[0].voter_count)
+                no_votes = int(poll_result.options[1].voter_count)
+            elif (
+                self.message2
+                and self.message2.poll
+                and len(self.message2.poll.options) >= 2
+            ):
+                yes_votes = int(self.message2.poll.options[0].voter_count)
+                no_votes = int(self.message2.poll.options[1].voter_count)
 
         total_votes = yes_votes + no_votes
         min_voters = int(self.group_settings.get("mini_voters", 1))
@@ -336,3 +404,99 @@ class JoinRequestVote:
             await self._safe_delete_message(self.chat_id, self.message2.message_id)
 
         await self.bot.answer_callback_query(callback_query_id=call.id, text="Done")
+
+    async def handle_vote(self, call: types.CallbackQuery, option: str):
+        if not self.group_settings.get("advanced_vote", False):
+            await self.bot.answer_callback_query(
+                callback_query_id=call.id,
+                text="Expired",
+            )
+            return
+
+        waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
+        if waiting is not True:
+            await self.bot.answer_callback_query(
+                callback_query_id=call.id,
+                text="Expired",
+            )
+            return
+
+        if option not in {"yes", "no"}:
+            await self.bot.answer_callback_query(
+                callback_query_id=call.id,
+                text="Invalid vote",
+            )
+            return
+
+        if not await self._is_group_member(call.from_user.id):
+            await self.bot.answer_callback_query(
+                callback_query_id=call.id,
+                text=t(self.language, "insufficient_permissions"),
+                show_alert=True,
+            )
+            return
+
+        async with self._vote_lock:
+            if self._has_voted(call.from_user.id):
+                await self.bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text=t(self.language, "jr_already_voted"),
+                    show_alert=True,
+                )
+                return
+
+            full_name = call.from_user.full_name
+            if option == "yes":
+                self._yes_voters[call.from_user.id] = full_name
+            else:
+                self._no_voters[call.from_user.id] = full_name
+
+        await self.bot.answer_callback_query(
+            callback_query_id=call.id,
+            text=t(self.language, "jr_vote_recorded"),
+        )
+
+    async def handle_realtime_result_request(self, message: types.Message):
+        waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
+        if waiting is not True:
+            await self.bot.reply_to(message, "Expired")
+            return
+
+        user_id = message.from_user.id if message.from_user else None
+        if user_id is None:
+            return
+
+        if not await self._is_group_member(user_id):
+            await self.bot.reply_to(
+                message, t(self.language, "insufficient_permissions")
+            )
+            return
+
+        async with self._vote_lock:
+            if not self._has_voted(user_id):
+                await self.bot.reply_to(message, t(self.language, "jr_not_voted"))
+                return
+
+            yes_votes = len(self._yes_voters)
+            no_votes = len(self._no_voters)
+
+            if self.group_settings.get("anonymous_vote", True):
+                text = t(
+                    self.language,
+                    "jr_live_votes_anonymous",
+                    yes_votes=yes_votes,
+                    no_votes=no_votes,
+                )
+            else:
+                yes_names = "\n".join(self._yes_voters.values()) or "-"
+                no_names = "\n".join(self._no_voters.values()) or "-"
+                text = t(
+                    self.language,
+                    "jr_live_votes_public",
+                    yes_votes=yes_votes,
+                    no_votes=no_votes,
+                    yes_names=yes_names,
+                    no_names=no_names,
+                )
+
+        await self.bot.reply_to(message, text)
