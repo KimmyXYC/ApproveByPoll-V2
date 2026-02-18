@@ -1,95 +1,157 @@
-# TelegramBotTemplate
+# ApproveByPoll-V2
 
-![Ruff](https://github.com/sudoskys/TelegramBotTemplate/actions/workflows/ruff.yml/badge.svg)
+A Telegram bot that manages group join requests with voting workflows.
 
-## Project Description
+## Highlights
 
-This project is a template for creating Telegram bots using Python.
+- Vote-based join approval with timeout, minimum-voter threshold, and admin override actions.
+- Two voting modes:
+  - Normal Telegram poll mode.
+  - Advanced button mode (Yes/No + live result query).
+- Multi-language support (`en_US`, `zh_CN`, `zh_TW`) with per-group language setting.
+- Group settings panel with inline controls and `/setting` command arguments.
+- Optional log channel updates (Pending -> Approved/Denied edit-in-place).
+- PostgreSQL storage for group settings and join request lifecycle.
 
-## Usage
+## Requirements
 
-Provide instructions on how to use your project. For example:
+- Python `3.12+`
+- PostgreSQL `14+` (recommended 15/16)
+- Telegram Bot token
 
-```shell
-pip install pdm
+## Quick Start (Local)
 
+1. Prepare config files.
+2. Install dependencies with `uv` or `pdm`.
+3. Start the bot.
+
+```bash
+uv sync
+uv run python main.py
 ```
 
-- Change Configuration
+Or with PDM:
 
-```shell
-nano pyproject.toml # Fix the name and email
-
+```bash
+pdm install
+pdm run python main.py
 ```
 
-### Pydantic V2
+## Configuration
 
-Pydantic is a library for data validation and settings management based on Python type annotations.
+### 1) Telegram token (`.env`)
 
-```shell
-nano .env
+Copy `.env.exp` to `.env` and fill your token:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456:ABC...
+# TELEGRAM_BOT_PROXY_ADDRESS=socks5://127.0.0.1:7890
 ```
 
-### PM2
+### 2) Runtime settings (`conf_dir/.secrets.toml`)
 
-pm2 is a run-time and deployment management tool.
+Copy `conf_dir/.secrets.toml.exp` to `conf_dir/.secrets.toml` and edit values:
 
-```shell
-pm2 start pm2.json
-pm2 monit
-pm2 restart pm2.json
-pm2 stop pm2.json
+```toml
+[botapi]
+enable = false
+api_server = "http://127.0.0.1:8081"
 
+[database]
+host = "127.0.0.1"
+port = 5432
+user = "postgres"
+password = "postgres"
+dbname = "postgres"
+
+[logchannel]
+enable = false
+channel_id = -1001234567890
+message_thread_id = 0
 ```
 
-### dynaconf
+`message_thread_id = 0` means "do not use thread id".
 
-dynaconf is a Python library that provides a flexible and dynamic configuration management solution for your
-applications. It allows you to easily manage and access configuration settings from various sources such as environment
-variables, YAML files, JSON files, INI files, and more.
+### 3) App settings (`conf_dir/settings.toml`)
 
-### Pre-commit
-
-pre-commit is a framework for managing and maintaining multi-language pre-commit hooks.
-
-```shell
-pre-commit install
-pre-commit run --all-files
-
+```toml
+[app]
+debug = false
 ```
 
-### PDM
+## Run
 
-pdm is a modern Python package manager with PEP 582 support.
-
-```shell
-add        # Add package(s) to pyproject.toml and install them
-build      # Build artifacts for distribution
-cache      # Control the caches of PDM
-completion # Generate completion scripts for the given shell
-config     # Display the current configuration
-export     # Export the locked packages set to other formats
-fix        # Fix the project problems according to the latest version of PDM
-import     # Import project metadata from other formats
-info       # Show the project information
-init       # Initialize a pyproject.toml for PDM
-install    # Install dependencies from lock file
-list       # List packages installed in the current working set
-lock       # Resolve and lock dependencies
-publish    # Build and publish the project to PyPI
-remove     # Remove packages from pyproject.toml
-run        # Run commands or scripts with local packages loaded
-search     # Search for PyPI packages
-show       # Show the package information
-sync       # Synchronize the current working set with lock file
-update     # Update package(s) in pyproject.toml
-use        # Use the given python version or path as base interpreter
-venv       # Virtualenv management
-
+```bash
+python main.py
 ```
+
+On startup, the bot connects to PostgreSQL and creates required tables if missing.
+
+## Commands
+
+- `/help` - Show help information.
+- `/setting` - Open group settings panel.
+- `/setting time <seconds|10m30s>` - Set vote duration (`30-3600` seconds).
+- `/setting voter <count>` - Set minimum voters (`1-500`).
+- `/setting mini_voters <count>` - Alias for `voter`.
+
+## Docker
+
+### Build image
+
+```bash
+docker build -t approvebypoll-v2:local .
+```
+
+### Run with Docker Compose
+
+1. Copy and edit config files:
+   - `.env.exp` -> `.env`
+   - `conf_dir/.secrets.toml.exp` -> `conf_dir/.secrets.toml`
+2. Start:
+
+```bash
+docker compose up -d --build
+```
+
+3. Logs:
+
+```bash
+docker compose logs -f bot
+```
+
+4. Stop:
+
+```bash
+docker compose down
+```
+
+## GitHub Container Registry (GHCR)
+
+This repo includes a workflow to auto-build and push Docker images to GHCR.
+
+- Workflow file: `.github/workflows/docker-ghcr.yml`
+- Trigger:
+  - Push to `main`
+  - Tag pushes `v*`
+  - Manual dispatch
+
+Published image path format:
+
+`ghcr.io/<owner>/<repo>:<tag>`
+
+Examples:
+
+- `ghcr.io/kimmyxyc/approvebypoll-v2:main`
+- `ghcr.io/kimmyxyc/approvebypoll-v2:latest`
+- `ghcr.io/kimmyxyc/approvebypoll-v2:v2.0.0`
+
+## Notes
+
+- Keep `.env` and `conf_dir/.secrets.toml` out of Git.
+- For production, give the bot only required admin permissions.
+- If poll sending fails in your Telegram environment, the bot can fallback to advanced button voting mode.
 
 ## License
 
-Provide information about the license your project is under. For example, if your project is under the MIT license, you
-could include the following text:
-This project is licensed under the MIT License - see the LICENSE.md file for details
+MIT
