@@ -83,7 +83,7 @@ class AsyncPostgresDB:
                         anonymous_vote BOOLEAN NOT NULL DEFAULT TRUE,
                         advanced_vote BOOLEAN NOT NULL DEFAULT FALSE,
                         language VARCHAR(16) NOT NULL DEFAULT 'en_US',
-                        mini_voters INTEGER NOT NULL DEFAULT 3
+                        mini_voters INTEGER NOT NULL DEFAULT 3 CHECK (mini_voters BETWEEN 1 AND 500)
                     )
                 """)
 

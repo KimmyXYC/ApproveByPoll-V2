@@ -1,3 +1,5 @@
+import re
+
 from telebot import types
 
 from utils.i18n import LANGUAGE_LABELS, normalize_language_code, t
@@ -11,6 +13,7 @@ TOGGLE_ITEMS = [
     "advanced_vote",
 ]
 VOTE_TIME_OPTIONS = [60, 120, 300, 600, 900, 1200, 1800, 2700, 3600]
+MINI_VOTERS_OPTIONS = [1, 2, 3, 5, 10, 20, 50, 100, 200]
 
 
 def _to_bool(value: str) -> bool | None:
@@ -57,8 +60,110 @@ async def _bot_can_pin_messages(bot, chat_id: int) -> bool:
 
 
 def _format_vote_time(language: str, seconds: int) -> str:
-    minutes = max(seconds // 60, 1)
-    return t(language, "setting_vote_minutes", minutes=minutes)
+    seconds = max(int(seconds), 0)
+    minutes = seconds // 60
+    remain_seconds = seconds % 60
+    if minutes and remain_seconds:
+        return t(
+            language,
+            "setting_vote_duration_min_sec",
+            minutes=minutes,
+            seconds=remain_seconds,
+        )
+    if minutes:
+        return t(language, "setting_vote_duration_minutes", minutes=minutes)
+    return t(language, "setting_vote_duration_seconds", seconds=remain_seconds)
+
+
+def _parse_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_time_seconds(value: str) -> int | None:
+    direct_int = _parse_int(value)
+    if direct_int is not None:
+        return direct_int
+
+    normalized = value.strip().lower()
+    match = re.fullmatch(r"(?:(\d+)m)?(?:(\d+)s)?", normalized)
+    if not match:
+        return None
+
+    minute_part = match.group(1)
+    second_part = match.group(2)
+    if minute_part is None and second_part is None:
+        return None
+
+    minutes = int(minute_part) if minute_part is not None else 0
+    seconds = int(second_part) if second_part is not None else 0
+    return minutes * 60 + seconds
+
+
+async def _handle_setting_command_with_args(
+    bot,
+    message: types.Message,
+    language: str,
+    group_id: int,
+) -> bool:
+    text = (message.text or "").strip()
+    parts = text.split()
+
+    if len(parts) == 1:
+        return False
+
+    if len(parts) != 3:
+        await bot.reply_to(message, t(language, "setting_command_usage"))
+        return True
+
+    item = parts[1].lower()
+    raw_value = parts[2]
+    if item == "time":
+        parsed_value = _parse_time_seconds(raw_value)
+        if parsed_value is None:
+            await bot.reply_to(message, t(language, "setting_invalid_integer"))
+            return True
+        if not 30 <= parsed_value <= 3600:
+            await bot.reply_to(message, t(language, "setting_time_out_of_range"))
+            return True
+        await BotDatabase.update_group_setting(
+            group_id=group_id,
+            item="vote_time",
+            value=parsed_value,
+        )
+        await bot.reply_to(
+            message,
+            t(
+                language,
+                "setting_time_updated",
+                value=_format_vote_time(language, parsed_value),
+            ),
+        )
+        return True
+
+    if item in {"voter", "mini_voters"}:
+        parsed_value = _parse_int(raw_value)
+        if parsed_value is None:
+            await bot.reply_to(message, t(language, "setting_invalid_integer"))
+            return True
+        if not 1 <= parsed_value <= 500:
+            await bot.reply_to(message, t(language, "setting_voter_out_of_range"))
+            return True
+        await BotDatabase.update_group_setting(
+            group_id=group_id,
+            item="mini_voters",
+            value=parsed_value,
+        )
+        await bot.reply_to(
+            message,
+            t(language, "setting_voter_updated", value=parsed_value),
+        )
+        return True
+
+    await bot.reply_to(message, t(language, "setting_command_usage"))
+    return True
 
 
 def _build_settings_text(group_settings: dict) -> str:
@@ -71,6 +176,7 @@ def _build_settings_text(group_settings: dict) -> str:
         f"{t(language, 'setting_clean_pinned_message')}: {'ON' if group_settings.get('clean_pinned_message') else 'OFF'}",
         f"{t(language, 'setting_advanced_vote')}: {'ON' if group_settings.get('advanced_vote') else 'OFF'}",
         f"{t(language, 'setting_vote_time')}: {_format_vote_time(language, int(group_settings.get('vote_time', 600)))}",
+        f"{t(language, 'setting_mini_voters')}: {int(group_settings.get('mini_voters', 3))}",
         f"{t(language, 'setting_language')}: {LANGUAGE_LABELS.get(language, 'English')}",
     ]
     return "\n".join(lines)
@@ -108,6 +214,10 @@ def build_main_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton(
                 f"⏱️ {t(language, 'setting_vote_time')}",
                 callback_data=f"setting {group_id} vote_time menu",
+            ),
+            types.InlineKeyboardButton(
+                f"👥 {t(language, 'setting_mini_voters')}",
+                callback_data=f"setting {group_id} mini_voters menu",
             ),
             types.InlineKeyboardButton(
                 f"🌐 {t(language, 'setting_language')}",
@@ -180,6 +290,33 @@ def build_language_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup:
     return keyboard
 
 
+def build_mini_voters_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup:
+    language = normalize_language_code(group_settings.get("language"))
+    group_id = group_settings["group_id"]
+    current_value = int(group_settings.get("mini_voters", 3))
+
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    buttons = []
+    for option in MINI_VOTERS_OPTIONS:
+        label = str(option)
+        if option == current_value:
+            label = f"✅ {label}"
+        buttons.append(
+            types.InlineKeyboardButton(
+                label,
+                callback_data=f"setting {group_id} mini_voters {option}",
+            )
+        )
+    keyboard.add(*buttons)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            f"↩️ {t(language, 'setting_back')}",
+            callback_data=f"setting {group_id} back main",
+        )
+    )
+    return keyboard
+
+
 async def open_settings(bot, message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
@@ -193,6 +330,15 @@ async def open_settings(bot, message: types.Message):
     )
     if not has_permission:
         await bot.reply_to(message, t(language, "insufficient_permissions"))
+        return
+
+    handled = await _handle_setting_command_with_args(
+        bot=bot,
+        message=message,
+        language=language,
+        group_id=message.chat.id,
+    )
+    if handled:
         return
 
     await bot.reply_to(
@@ -287,6 +433,25 @@ async def handle_settings_callback(bot, call: types.CallbackQuery):
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=build_language_keyboard(group_settings),
+        )
+        await bot.answer_callback_query(callback_query_id=call.id)
+        return
+
+    if item == "mini_voters" and status == "menu":
+        await bot.edit_message_text(
+            text="\n".join(
+                [
+                    t(language, "setting_mini_voters_menu"),
+                    t(
+                        language,
+                        "setting_current_value",
+                        value=str(int(group_settings.get("mini_voters", 3))),
+                    ),
+                ]
+            ),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=build_mini_voters_keyboard(group_settings),
         )
         await bot.answer_callback_query(callback_query_id=call.id)
         return
@@ -402,6 +567,46 @@ async def handle_settings_callback(bot, call: types.CallbackQuery):
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=build_language_keyboard(group_settings),
+        )
+        await bot.answer_callback_query(
+            callback_query_id=call.id,
+            text=t(language, "setting_saved"),
+        )
+        return
+
+    if item == "mini_voters":
+        if not status.isdigit():
+            await bot.answer_callback_query(
+                callback_query_id=call.id, text="Invalid value"
+            )
+            return
+        mini_voters = int(status)
+        if mini_voters not in MINI_VOTERS_OPTIONS:
+            await bot.answer_callback_query(
+                callback_query_id=call.id, text="Invalid value"
+            )
+            return
+        await BotDatabase.update_group_setting(
+            group_id=group_id,
+            item="mini_voters",
+            value=mini_voters,
+        )
+        group_settings = await BotDatabase.get_group_settings(group_id)
+        language = normalize_language_code(group_settings.get("language"))
+        await bot.edit_message_text(
+            text="\n".join(
+                [
+                    t(language, "setting_mini_voters_menu"),
+                    t(
+                        language,
+                        "setting_current_value",
+                        value=str(mini_voters),
+                    ),
+                ]
+            ),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=build_mini_voters_keyboard(group_settings),
         )
         await bot.answer_callback_query(
             callback_query_id=call.id,
