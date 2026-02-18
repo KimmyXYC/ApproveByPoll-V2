@@ -41,6 +41,7 @@ MESSAGES = {
     "setting_back": "返回",
     "setting_saved": "設定已更新。",
     "setting_invalid_integer": "請輸入有效整數。",
+    "setting_anonymous_admin_not_allowed": "匿名管理員不允許使用此命令。",
     "setting_time_out_of_range": "投票時長必須在 30-3600 秒之間。",
     "setting_voter_out_of_range": "最少投票人數必須在 1-500 之間。",
     "setting_command_usage": "用法：/setting | /setting time <秒|10m30s> | /setting voter <人數> | /setting mini_voters <人數>",

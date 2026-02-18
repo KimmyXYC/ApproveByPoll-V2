@@ -41,6 +41,7 @@ MESSAGES = {
     "setting_back": "Back",
     "setting_saved": "Setting updated.",
     "setting_invalid_integer": "Please provide a valid integer.",
+    "setting_anonymous_admin_not_allowed": "Anonymous admins are not allowed to use this command.",
     "setting_time_out_of_range": "Vote time must be between 30 and 3600 seconds.",
     "setting_voter_out_of_range": "Minimum voters must be between 1 and 500.",
     "setting_command_usage": "Usage: /setting | /setting time <seconds|10m30s> | /setting voter <count> | /setting mini_voters <count>",

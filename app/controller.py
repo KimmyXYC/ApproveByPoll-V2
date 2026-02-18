@@ -63,7 +63,7 @@ class BotRunner(object):
                 return
             error = done_task.exception()
             if error:
-                logger.opt(exception=error).exception(
+                logger.opt(exception=error).error(
                     f"join request task failed: uuid={uuid}"
                 )
 
@@ -80,6 +80,7 @@ class BotRunner(object):
             logger.info("🌐 Proxy tunnels are being used!")
 
         await event.set_bot_commands(bot)
+        logger.info("🤖 Bot commands set")
 
         @bot.message_handler(commands=["start", "help"], chat_types=["private"])
         async def listen_help_command(message: types.Message):

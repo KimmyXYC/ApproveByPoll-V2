@@ -107,6 +107,7 @@ async def _handle_setting_command_with_args(
     message: types.Message,
     language: str,
     group_id: int,
+    is_anonymous_admin: bool = False,
 ) -> bool:
     text = (message.text or "").strip()
     parts = text.split()
@@ -120,6 +121,11 @@ async def _handle_setting_command_with_args(
 
     item = parts[1].lower()
     raw_value = parts[2]
+
+    if is_anonymous_admin and item in {"time", "voter", "mini_voters"}:
+        await bot.reply_to(message, t(language, "setting_anonymous_admin_not_allowed"))
+        return True
+
     if item == "time":
         parsed_value = _parse_time_seconds(raw_value)
         if parsed_value is None:
@@ -320,11 +326,38 @@ def build_mini_voters_keyboard(group_settings: dict) -> types.InlineKeyboardMark
 async def open_settings(bot, message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
         return
-    if not message.from_user:
-        return
 
     group_settings = await BotDatabase.get_group_settings(message.chat.id)
     language = normalize_language_code(group_settings.get("language"))
+
+    is_anonymous_admin = bool(
+        message.sender_chat
+        and message.chat
+        and message.sender_chat.id == message.chat.id
+        and message.chat.type in ["group", "supergroup"]
+    )
+
+    if is_anonymous_admin:
+        handled = await _handle_setting_command_with_args(
+            bot=bot,
+            message=message,
+            language=language,
+            group_id=message.chat.id,
+            is_anonymous_admin=True,
+        )
+        if handled:
+            return
+
+        await bot.reply_to(
+            message=message,
+            text=_build_settings_text(group_settings),
+            reply_markup=build_main_keyboard(group_settings),
+        )
+        return
+
+    if not message.from_user:
+        return
+
     has_permission = await _can_change_group_info(
         bot, message.chat.id, message.from_user.id
     )
@@ -337,6 +370,7 @@ async def open_settings(bot, message: types.Message):
         message=message,
         language=language,
         group_id=message.chat.id,
+        is_anonymous_admin=False,
     )
     if handled:
         return

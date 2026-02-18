@@ -19,6 +19,7 @@ class JoinRequestVote:
         self.group_settings = group_settings
         self.language = group_settings.get("language")
         self.vote_time = int(group_settings.get("vote_time", 600))
+        self.advanced_vote_enabled = bool(group_settings.get("advanced_vote", False))
         self.message1 = None
         self.message2 = None
         self.message3 = None
@@ -145,7 +146,7 @@ class JoinRequestVote:
             return
 
     async def _safe_stop_poll(self):
-        if self.group_settings.get("advanced_vote", False):
+        if self.advanced_vote_enabled:
             return None
         if not self.message2:
             return None
@@ -156,6 +157,35 @@ class JoinRequestVote:
             )
         except Exception:
             return None
+
+    async def _close_failed_request(self):
+        applicant = self.request.from_user
+        applicant_display = self._user_display(applicant)
+
+        if self.message1:
+            try:
+                await self._refresh_message1(
+                    "jr_status_rejected",
+                    user=applicant_display,
+                    user_id=applicant.id,
+                )
+            except Exception:
+                pass
+
+        try:
+            await BotDatabase.update_join_request(
+                uuid=self.uuid,
+                result=False,
+                yes_votes=0,
+                no_votes=0,
+            )
+        except Exception:
+            pass
+
+        try:
+            await self._apply_join_result(False)
+        except Exception:
+            pass
 
     async def _apply_join_result(self, approved: bool):
         if approved:
@@ -263,27 +293,45 @@ class JoinRequestVote:
         )
         await self._send_pending_log()
 
-        if self.group_settings.get("advanced_vote", False):
-            self.message2 = await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=t(self.language, "jr_poll_question"),
-                reply_to_message_id=self.message1.message_id,
-                reply_markup=await self._build_advanced_vote_keyboard(),
-                protect_content=True,
-            )
+        if self.advanced_vote_enabled:
+            try:
+                self.message2 = await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=t(self.language, "jr_poll_question"),
+                    reply_to_message_id=self.message1.message_id,
+                    reply_markup=await self._build_advanced_vote_keyboard(),
+                    protect_content=True,
+                )
+            except Exception:
+                await self._close_failed_request()
+                return
         else:
-            self.message2 = await self.bot.send_poll(
-                chat_id=self.chat_id,
-                question=t(self.language, "jr_poll_question"),
-                options=[
-                    t(self.language, "jr_poll_yes"),
-                    t(self.language, "jr_poll_no"),
-                ],
-                is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
-                protect_content=True,
-                allow_multiple_answers=False,
-                reply_to_message_id=self.message1.message_id,
-            )
+            try:
+                self.message2 = await self.bot.send_poll(
+                    chat_id=self.chat_id,
+                    question=t(self.language, "jr_poll_question"),
+                    options=[
+                        t(self.language, "jr_poll_yes"),
+                        t(self.language, "jr_poll_no"),
+                    ],
+                    is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
+                    protect_content=True,
+                    allow_multiple_answers=False,
+                    reply_to_message_id=self.message1.message_id,
+                )
+            except Exception:
+                self.advanced_vote_enabled = True
+                try:
+                    self.message2 = await self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=t(self.language, "jr_poll_question"),
+                        reply_to_message_id=self.message1.message_id,
+                        reply_markup=await self._build_advanced_vote_keyboard(),
+                        protect_content=True,
+                    )
+                except Exception:
+                    await self._close_failed_request()
+                    return
 
         if self.group_settings.get("pin_msg", False):
             try:
@@ -295,15 +343,18 @@ class JoinRequestVote:
             except Exception:
                 pass
 
-        self.message3 = await self.bot.send_message(
-            chat_id=self.user_id,
-            text=t(
-                self.language,
-                "jr_apply_notice",
-                group_name=self.request.chat.title,
-                vote_minutes=self._vote_minutes(),
-            ),
-        )
+        try:
+            self.message3 = await self.bot.send_message(
+                chat_id=self.user_id,
+                text=t(
+                    self.language,
+                    "jr_apply_notice",
+                    group_name=self.request.chat.title,
+                    vote_minutes=self._vote_minutes(),
+                ),
+            )
+        except Exception:
+            self.message3 = None
 
         try:
             await asyncio.wait_for(self._manual_resolved.wait(), timeout=self.vote_time)
@@ -317,7 +368,7 @@ class JoinRequestVote:
 
         yes_votes = 0
         no_votes = 0
-        if self.group_settings.get("advanced_vote", False):
+        if self.advanced_vote_enabled:
             async with self._vote_lock:
                 yes_votes = len(self._yes_voters)
                 no_votes = len(self._no_voters)
@@ -518,7 +569,7 @@ class JoinRequestVote:
         await self.bot.answer_callback_query(callback_query_id=call.id, text="Done")
 
     async def handle_vote(self, call: types.CallbackQuery, option: str):
-        if not self.group_settings.get("advanced_vote", False):
+        if not self.advanced_vote_enabled:
             await self.bot.answer_callback_query(
                 callback_query_id=call.id,
                 text="Expired",
