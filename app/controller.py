@@ -2,17 +2,18 @@
 # @Time    : 2023/11/18 上午12:18
 # @File    : controller.py
 # @Software: PyCharm
-
 from asgiref.sync import sync_to_async
 from loguru import logger
 from telebot import types
-from telebot import util, formatting
+from telebot import util
 from telebot.async_telebot import AsyncTeleBot
 from telebot.asyncio_helper import ApiTelegramException
 from telebot.asyncio_storage import StateMemoryStorage
 
 from setting.telegrambot import BotSetting
 from app_conf import settings
+from app import event
+from utils.postgres import BotDatabase
 
 StepCache = StateMemoryStorage()
 
@@ -55,20 +56,17 @@ class BotRunner(object):
             asyncio_helper.proxy = BotSetting.proxy_address
             logger.info("🌐 Proxy tunnels are being used!")
 
-        @bot.message_handler(
-            commands="help", chat_types=["private"]
-        )
+        await event.set_bot_commands(bot)
+
+        @bot.message_handler(commands=["start", "help"], chat_types=["private"])
         async def listen_help_command(message: types.Message):
-            _message = await bot.reply_to(
-                message=message,
-                text=formatting.format_text(
-                    formatting.mbold("🥕 Help"),
-                    formatting.mlink(
-                        "🍀 Github", "https://github.com/KimmyXYC/ApproveByPoll-V2"
-                    ),
-                ),
-                parse_mode="MarkdownV2",
-            )
+            await event.listen_help_command(bot, message)
+
+        @bot.chat_join_request_handler()
+        async def handle_join_request(request: types.ChatJoinRequest):
+            group_settings = await BotDatabase.get_group_settings(request.chat.id)
+            if group_settings.get("vote_to_join", True):
+                pass
 
         try:
             logger.success("✨ Bot 启动成功,开始轮询...")
