@@ -16,7 +16,7 @@ class AsyncPostgresDB:
         "clean_pinned_message": False,
         "anonymous_vote": True,
         "advanced_vote": False,
-        "language": "zh-CN",
+        "language": "en_US",
         "mini_voters": 3,
     }
 
@@ -82,7 +82,7 @@ class AsyncPostgresDB:
                         clean_pinned_message BOOLEAN NOT NULL DEFAULT FALSE,
                         anonymous_vote BOOLEAN NOT NULL DEFAULT TRUE,
                         advanced_vote BOOLEAN NOT NULL DEFAULT FALSE,
-                        language VARCHAR(16) NOT NULL DEFAULT 'zh-CN',
+                        language VARCHAR(16) NOT NULL DEFAULT 'en_US',
                         mini_voters INTEGER NOT NULL DEFAULT 3
                     )
                 """)
@@ -158,7 +158,9 @@ class AsyncPostgresDB:
                 )
                 return dict(inserted_or_existing)
         except Exception as e:
-            logger.error(f"Error getting/creating group settings for {group_id}: {str(e)}")
+            logger.error(
+                f"Error getting/creating group settings for {group_id}: {str(e)}"
+            )
             raise
 
     async def create_join_request(self, uuid: str, group_id: int, user_id: int) -> None:
@@ -270,6 +272,39 @@ class AsyncPostgresDB:
                 return waiting
         except Exception as e:
             logger.error(f"Error querying waiting status for uuid={uuid}: {str(e)}")
+            raise
+
+    async def update_group_setting(self, group_id: int, item: str, value) -> bool:
+        """
+        Update one allowed group setting field.
+        Returns True if one row is updated.
+        """
+        allowed_fields = {
+            "vote_to_join",
+            "vote_time",
+            "pin_msg",
+            "clean_pinned_message",
+            "anonymous_vote",
+            "advanced_vote",
+            "language",
+            "mini_voters",
+        }
+        if item not in allowed_fields:
+            raise ValueError(f"Unsupported setting field: {item}")
+
+        try:
+            await self.get_group_settings(group_id)
+            async with self.conn.acquire() as connection:
+                execute_result = await connection.execute(
+                    f"UPDATE setting SET {item} = $2 WHERE group_id = $1",
+                    group_id,
+                    value,
+                )
+                return execute_result.endswith("1")
+        except Exception as e:
+            logger.error(
+                f"Error updating group setting for group_id={group_id}, item={item}: {str(e)}"
+            )
             raise
 
 

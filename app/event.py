@@ -3,13 +3,16 @@
 # @Author  : KimmyXYC
 # @File    : event.py
 # @Software: PyCharm
-from telebot import types, formatting
+from telebot import formatting, types
+
+from app.settings_menu import handle_settings_callback, open_settings
+from utils.i18n import t
 
 
 async def set_bot_commands(bot):
     commands = [
-        types.BotCommand("help", "获取帮助信息"),
-        types.BotCommand("setting", "设置"),
+        types.BotCommand("help", "Help"),
+        types.BotCommand("setting", "Group settings"),
     ]
 
     await bot.set_my_commands(commands, scope=types.BotCommandScopeDefault())
@@ -18,12 +21,13 @@ async def set_bot_commands(bot):
 
 
 async def listen_help_command(bot, message: types.Message):
-    _message = await bot.reply_to(
+    await bot.reply_to(
         message=message,
         text=formatting.format_text(
-            formatting.mbold("🥕 Help"),
+            formatting.mbold(f"🥕 {t('en_US', 'help_title')}"),
             formatting.mlink(
-                "🍀 Github", "https://github.com/KimmyXYC/ApproveByPoll-V2"
+                f"🍀 {t('en_US', 'help_github')}",
+                "https://github.com/KimmyXYC/ApproveByPoll-V2",
             ),
         ),
         parse_mode="MarkdownV2",

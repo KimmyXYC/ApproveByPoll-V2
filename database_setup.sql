@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS setting (
     clean_pinned_message BOOLEAN NOT NULL DEFAULT FALSE,
     anonymous_vote BOOLEAN NOT NULL DEFAULT TRUE,
     advanced_vote BOOLEAN NOT NULL DEFAULT FALSE,
-    language VARCHAR(16) NOT NULL DEFAULT 'zh-CN',
+    language VARCHAR(16) NOT NULL DEFAULT 'en_US',
     mini_voters INTEGER NOT NULL DEFAULT 3
 );
 

@@ -28,8 +28,8 @@ requires-python = ">=3.12"
 readme = "README.md"
 license = "MIT"
 
-[tool.setuptools]
-packages = ["app", "setting", "conf_dir"]
+[tool.setuptools.packages.find]
+include = ["app*", "setting*", "utils*"]
 
 [project.optional-dependencies]
 dev = [
