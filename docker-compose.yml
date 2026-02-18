@@ -21,7 +21,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/your-org/approvebypoll-v2:local
+    image: ghcr.io/kimmyxyc/approvebypoll-v2:latest
     container_name: approvebypoll-bot
     restart: unless-stopped
     depends_on:
