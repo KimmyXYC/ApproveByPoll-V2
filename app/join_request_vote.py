@@ -1,6 +1,7 @@
 import asyncio
 import html
 
+from loguru import logger
 from telebot import types
 
 from app_conf import settings
@@ -267,6 +268,14 @@ class JoinRequestVote:
     async def run(self):
         applicant = self.request.from_user
         applicant_display = self._user_display(applicant)
+        logger.debug(
+            "join request flow start uuid={} chat_id={} user_id={} advanced_vote={} anonymous_vote={}",
+            self.uuid,
+            self.chat_id,
+            self.user_id,
+            self.advanced_vote_enabled,
+            bool(self.group_settings.get("anonymous_vote", True)),
+        )
 
         msg1_text = t(
             self.language,
@@ -291,6 +300,12 @@ class JoinRequestVote:
             parse_mode="HTML",
             reply_markup=keyboard,
         )
+        logger.debug(
+            "message1 sent uuid={} chat_id={} message_id={}",
+            self.uuid,
+            self.chat_id,
+            self.message1.message_id,
+        )
         await self._send_pending_log()
 
         if self.advanced_vote_enabled:
@@ -302,7 +317,18 @@ class JoinRequestVote:
                     reply_markup=await self._build_advanced_vote_keyboard(),
                     protect_content=True,
                 )
+                logger.debug(
+                    "advanced message2 sent uuid={} chat_id={} message_id={}",
+                    self.uuid,
+                    self.chat_id,
+                    self.message2.message_id,
+                )
             except Exception:
+                logger.exception(
+                    "failed to send advanced message2 uuid={} chat_id={}",
+                    self.uuid,
+                    self.chat_id,
+                )
                 await self._close_failed_request()
                 return
         else:
@@ -316,10 +342,21 @@ class JoinRequestVote:
                     ],
                     is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
                     protect_content=True,
-                    allow_multiple_answers=False,
+                    allows_multiple_answers=False,
                     reply_to_message_id=self.message1.message_id,
                 )
+                logger.debug(
+                    "poll message2 sent uuid={} chat_id={} message_id={}",
+                    self.uuid,
+                    self.chat_id,
+                    self.message2.message_id,
+                )
             except Exception:
+                logger.exception(
+                    "failed to send poll message2, fallback to advanced uuid={} chat_id={}",
+                    self.uuid,
+                    self.chat_id,
+                )
                 self.advanced_vote_enabled = True
                 try:
                     self.message2 = await self.bot.send_message(
@@ -329,7 +366,18 @@ class JoinRequestVote:
                         reply_markup=await self._build_advanced_vote_keyboard(),
                         protect_content=True,
                     )
+                    logger.warning(
+                        "poll fallback activated, advanced message2 sent uuid={} chat_id={} message_id={}",
+                        self.uuid,
+                        self.chat_id,
+                        self.message2.message_id,
+                    )
                 except Exception:
+                    logger.exception(
+                        "failed to send fallback advanced message2 uuid={} chat_id={}",
+                        self.uuid,
+                        self.chat_id,
+                    )
                     await self._close_failed_request()
                     return
 
@@ -340,7 +388,19 @@ class JoinRequestVote:
                     message_id=self.message2.message_id,
                     disable_notification=True,
                 )
+                logger.debug(
+                    "message2 pinned uuid={} chat_id={} message_id={}",
+                    self.uuid,
+                    self.chat_id,
+                    self.message2.message_id,
+                )
             except Exception:
+                logger.exception(
+                    "failed to pin message2 uuid={} chat_id={} message_id={}",
+                    self.uuid,
+                    self.chat_id,
+                    self.message2.message_id if self.message2 else None,
+                )
                 pass
 
         try:
@@ -353,7 +413,18 @@ class JoinRequestVote:
                     vote_minutes=self._vote_minutes(),
                 ),
             )
+            logger.debug(
+                "message3 sent to applicant uuid={} user_id={} message_id={}",
+                self.uuid,
+                self.user_id,
+                self.message3.message_id,
+            )
         except Exception:
+            logger.exception(
+                "failed to send message3 to applicant uuid={} user_id={}",
+                self.uuid,
+                self.user_id,
+            )
             self.message3 = None
 
         try:
@@ -364,6 +435,9 @@ class JoinRequestVote:
 
         waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
         if waiting is not True:
+            logger.debug(
+                "join request already resolved before timeout uuid={}", self.uuid
+            )
             return
 
         yes_votes = 0
@@ -402,6 +476,14 @@ class JoinRequestVote:
 
         total_votes = yes_votes + no_votes
         min_voters = int(self.group_settings.get("mini_voters", 1))
+        logger.debug(
+            "vote result collected uuid={} yes_votes={} no_votes={} total={} min_voters={}",
+            self.uuid,
+            yes_votes,
+            no_votes,
+            total_votes,
+            min_voters,
+        )
 
         if total_votes < min_voters:
             self.message4 = await self.bot.send_message(
@@ -473,6 +555,7 @@ class JoinRequestVote:
             await self._safe_delete_message(self.chat_id, self.message2.message_id)
         if self.message4:
             await self._safe_delete_message(self.chat_id, self.message4.message_id)
+        logger.debug("join request flow completed uuid={}", self.uuid)
 
     async def handle_action(self, call: types.CallbackQuery, action: str):
         if not await self._check_invite_permission(call.from_user.id):
@@ -508,8 +591,8 @@ class JoinRequestVote:
                 user_id=applicant.id,
                 admin=admin_display,
             )
-            await self._apply_join_result(True)
             await self._notify_applicant("jr_private_approved")
+            await self._apply_join_result(True)
             await self._edit_log_result(
                 status="Approved",
                 admin_id=call.from_user.id,
@@ -527,8 +610,8 @@ class JoinRequestVote:
                 user_id=applicant.id,
                 admin=admin_display,
             )
-            await self._apply_join_result(False)
             await self._notify_applicant("jr_private_rejected")
+            await self._apply_join_result(False)
             await self._edit_log_result(
                 status="Denied",
                 admin_id=call.from_user.id,
@@ -546,9 +629,9 @@ class JoinRequestVote:
                 user_id=applicant.id,
                 admin=admin_display,
             )
+            await self._notify_applicant("jr_private_rejected")
             await self._apply_join_result(False)
             await self.bot.ban_chat_member(chat_id=self.chat_id, user_id=self.user_id)
-            await self._notify_applicant("jr_private_rejected")
             await self._edit_log_result(
                 status="Denied",
                 admin_id=call.from_user.id,
