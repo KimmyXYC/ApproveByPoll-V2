@@ -146,6 +146,17 @@ class JoinRequestVote:
         except Exception:
             return
 
+    async def _safe_unpin_message(self, message_id: int | None):
+        if not message_id:
+            return
+        try:
+            await self.bot.unpin_chat_message(
+                chat_id=self.chat_id,
+                message_id=message_id,
+            )
+        except Exception:
+            return
+
     async def _safe_stop_poll(self):
         if self.advanced_vote_enabled:
             return None
@@ -552,6 +563,8 @@ class JoinRequestVote:
                 user_id=applicant.id,
             )
             await self._notify_applicant(private_key)
+            if self.group_settings.get("pin_msg", False) and self.message2:
+                await self._safe_unpin_message(self.message2.message_id)
             await BotDatabase.update_join_request(
                 uuid=self.uuid,
                 result=approved,
@@ -661,6 +674,8 @@ class JoinRequestVote:
 
         self._manual_resolved.set()
         await self._safe_stop_poll()
+        if self.group_settings.get("pin_msg", False) and self.message2:
+            await self._safe_unpin_message(self.message2.message_id)
         if self.message2:
             await self._safe_delete_message(self.chat_id, self.message2.message_id)
 
