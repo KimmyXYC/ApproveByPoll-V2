@@ -277,7 +277,11 @@ def build_language_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup:
     current_language = normalize_language_code(group_settings.get("language"))
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    for code in ["zh_CN", "zh_TW", "en_US"]:
+    preferred_order = ["zh_CN", "zh_TW", "en_US", "fr_FR", "ru_RU"]
+    ordered_codes = [code for code in preferred_order if code in LANGUAGE_LABELS]
+    ordered_codes.extend(code for code in LANGUAGE_LABELS if code not in ordered_codes)
+
+    for code in ordered_codes:
         label = LANGUAGE_LABELS[code]
         if code == current_language:
             label = f"✅ {label}"
