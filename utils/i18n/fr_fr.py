@@ -37,7 +37,7 @@ MESSAGES = {
     "setting_vote_to_join": "Vote pour rejoindre",
     "setting_anonymous_vote": "Vote anonyme",
     "setting_pin_msg": "Epingler le message du sondage",
-    "setting_clean_pinned_message": "Nettoyer le message epingle",
+    "setting_clean_pinned_message": "Nettoyer le message de service epingle",
     "setting_advanced_vote": "Vote avance",
     "setting_vote_time": "Duree du vote",
     "setting_mini_voters": "Votants minimum",

@@ -37,7 +37,7 @@ MESSAGES = {
     "setting_vote_to_join": "Vote To Join",
     "setting_anonymous_vote": "Anonymous Vote",
     "setting_pin_msg": "Pin Poll Message",
-    "setting_clean_pinned_message": "Clean Pinned Message",
+    "setting_clean_pinned_message": "Clean Pinned Service Message",
     "setting_advanced_vote": "Advanced Vote",
     "setting_vote_time": "Vote Time",
     "setting_mini_voters": "Min Voters",

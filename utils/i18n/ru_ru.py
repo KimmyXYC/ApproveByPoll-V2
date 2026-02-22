@@ -37,7 +37,7 @@ MESSAGES = {
     "setting_vote_to_join": "Golosovanie dlya vstupa",
     "setting_anonymous_vote": "Anonimnoe golosovanie",
     "setting_pin_msg": "Zakrepit soobshchenie oprosa",
-    "setting_clean_pinned_message": "Ochistit zakreplennoe soobshchenie",
+    "setting_clean_pinned_message": "Ochistit zakreplennoe sluzhebnoe soobshchenie",
     "setting_advanced_vote": "Rasshirennoe golosovanie",
     "setting_vote_time": "Vremya golosovaniya",
     "setting_mini_voters": "Minimum golosuyushchikh",

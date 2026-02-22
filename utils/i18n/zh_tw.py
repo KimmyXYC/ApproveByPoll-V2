@@ -37,7 +37,7 @@ MESSAGES = {
     "setting_vote_to_join": "入群需投票",
     "setting_anonymous_vote": "匿名投票",
     "setting_pin_msg": "置頂投票訊息",
-    "setting_clean_pinned_message": "清理置頂訊息",
+    "setting_clean_pinned_message": "清理置頂服務訊息",
     "setting_advanced_vote": "進階投票",
     "setting_vote_time": "投票時長",
     "setting_mini_voters": "最少投票人數",
