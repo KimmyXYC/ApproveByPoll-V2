@@ -31,6 +31,22 @@ class JoinRequestVote:
         self._no_voters: dict[int, str] = {}
         self.log_message_id: int | None = None
 
+    def _log_step_failure(self, step: str):
+        logger.exception(
+            "join request step failed uuid={} chat_id={} user_id={} step={}",
+            self.uuid,
+            self.chat_id,
+            self.user_id,
+            step,
+        )
+
+    async def _run_best_effort(self, step: str, coro, default=None):
+        try:
+            return await coro
+        except Exception:
+            self._log_step_failure(step)
+            return default
+
     @property
     def chat_id(self) -> int:
         return self.request.chat.id
@@ -56,6 +72,11 @@ class JoinRequestVote:
     def _vote_minutes(self) -> int:
         minutes = self.vote_time // 60
         return max(minutes, 1)
+
+    def _reply_to_message_id(self) -> int | None:
+        if not self.message1:
+            return None
+        return self.message1.message_id
 
     def _build_log_text(
         self,
@@ -175,29 +196,26 @@ class JoinRequestVote:
         applicant_display = self._user_display(applicant)
 
         if self.message1:
-            try:
-                await self._refresh_message1(
+            await self._run_best_effort(
+                "refresh_message1",
+                self._refresh_message1(
                     "jr_status_rejected",
                     user=applicant_display,
                     user_id=applicant.id,
-                )
-            except Exception:
-                pass
-
-        try:
-            await BotDatabase.update_join_request(
-                uuid=self.uuid,
-                result=False,
-                yes_votes=0,
-                no_votes=0,
+                ),
             )
-        except Exception:
-            pass
 
-        try:
-            await self._apply_join_result(False)
-        except Exception:
-            pass
+        await self._safe_update_join_request(
+            uuid=self.uuid,
+            result=False,
+            yes_votes=0,
+            no_votes=0,
+        )
+
+        await self._run_best_effort(
+            "apply_join_result",
+            self._apply_join_result(False),
+        )
 
     async def _apply_join_result(self, approved: bool):
         if approved:
@@ -212,22 +230,38 @@ class JoinRequestVote:
             )
 
     async def _check_invite_permission(self, user_id: int) -> bool:
-        member = await self.bot.get_chat_member(chat_id=self.chat_id, user_id=user_id)
-        if member.status == "creator":
-            return True
-        if member.status != "administrator":
+        try:
+            member = await self.bot.get_chat_member(
+                chat_id=self.chat_id, user_id=user_id
+            )
+            if member.status == "creator":
+                return True
+            if member.status != "administrator":
+                return False
+            return bool(getattr(member, "can_invite_users", False))
+        except Exception:
+            self._log_step_failure("check_invite_permission")
             return False
-        return bool(getattr(member, "can_invite_users", False))
 
     async def _is_group_member(self, user_id: int) -> bool:
-        member = await self.bot.get_chat_member(chat_id=self.chat_id, user_id=user_id)
-        return member.status not in {"left", "kicked"}
+        try:
+            member = await self.bot.get_chat_member(
+                chat_id=self.chat_id, user_id=user_id
+            )
+            return member.status not in {"left", "kicked"}
+        except Exception:
+            self._log_step_failure("is_group_member")
+            return False
 
     async def _get_bot_username(self) -> str:
         if BotSetting.bot_username:
             return BotSetting.bot_username
-        me = await self.bot.get_me()
-        return me.username
+        try:
+            me = await self.bot.get_me()
+            return me.username or ""
+        except Exception:
+            self._log_step_failure("get_bot_username")
+            return ""
 
     def _has_voted(self, user_id: int) -> bool:
         return user_id in self._yes_voters or user_id in self._no_voters
@@ -245,12 +279,13 @@ class JoinRequestVote:
                 callback_data=f"jrv {self.uuid} no",
             ),
         )
-        keyboard.add(
-            types.InlineKeyboardButton(
-                text=t(self.language, "jr_live_result"),
-                url=f"https://t.me/{bot_username}?start=jrres_{self.uuid}",
+        if bot_username:
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    text=t(self.language, "jr_live_result"),
+                    url=f"https://t.me/{bot_username}?start=jrres_{self.uuid}",
+                )
             )
-        )
         return keyboard
 
     async def _refresh_message1(self, key: str, **kwargs):
@@ -262,6 +297,145 @@ class JoinRequestVote:
             text=t(self.language, key, **kwargs),
             parse_mode="HTML",
             reply_markup=None,
+        )
+
+    async def _safe_update_join_request(self, **kwargs) -> bool:
+        result = await self._run_best_effort(
+            "update_join_request",
+            BotDatabase.update_join_request(**kwargs),
+            default=False,
+        )
+        return bool(result)
+
+    async def _safe_get_join_request_waiting(self) -> bool | None:
+        return await self._run_best_effort(
+            "get_join_request_waiting",
+            BotDatabase.get_join_request_waiting_by_uuid(self.uuid),
+            default=None,
+        )
+
+    async def _safe_get_join_request_status(self) -> dict | None:
+        return await self._run_best_effort(
+            "get_join_request_status",
+            BotDatabase.get_join_request_status_by_uuid(self.uuid),
+            default=None,
+        )
+
+    async def _safe_send_group_message(self, text: str):
+        kwargs = {
+            "chat_id": self.chat_id,
+            "text": text,
+        }
+        reply_to_message_id = self._reply_to_message_id()
+        if reply_to_message_id is not None:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        return await self._run_best_effort(
+            "send_group_message",
+            self.bot.send_message(**kwargs),
+        )
+
+    async def _safe_answer_callback_query(
+        self, callback_query_id: int | str, text: str, **kwargs
+    ):
+        return await self._run_best_effort(
+            "answer_callback_query",
+            self.bot.answer_callback_query(
+                callback_query_id=callback_query_id,
+                text=text,
+                **kwargs,
+            ),
+        )
+
+    async def _finalize_vote_result(
+        self,
+        applicant: types.User,
+        applicant_display: str,
+        *,
+        group_text_key: str,
+        status_key: str,
+        private_key: str,
+        approved: bool,
+        yes_votes: int,
+        no_votes: int,
+        unpin_message2: bool,
+    ):
+        self.message4 = await self._safe_send_group_message(
+            t(self.language, group_text_key)
+        )
+        await self._run_best_effort(
+            "refresh_message1",
+            self._refresh_message1(
+                status_key,
+                user=applicant_display,
+                user_id=applicant.id,
+            ),
+        )
+        await self._run_best_effort(
+            "notify_applicant",
+            self._notify_applicant(private_key),
+        )
+        if unpin_message2 and self.message2:
+            await self._safe_unpin_message(self.message2.message_id)
+        await self._safe_update_join_request(
+            uuid=self.uuid,
+            result=approved,
+            yes_votes=yes_votes,
+            no_votes=no_votes,
+        )
+        await self._run_best_effort(
+            "apply_join_result",
+            self._apply_join_result(approved),
+        )
+        await self._edit_log_result(
+            status="Approved" if approved else "Denied",
+            yes_votes=yes_votes,
+            no_votes=no_votes,
+        )
+
+    async def _finalize_admin_action(
+        self,
+        call: types.CallbackQuery,
+        *,
+        result: bool,
+        status_key: str,
+        private_key: str,
+        ban_user: bool = False,
+    ):
+        admin_display = self._admin_display(call.from_user)
+        applicant = self.request.from_user
+        applicant_display = self._user_display(applicant)
+
+        await self._safe_update_join_request(
+            uuid=self.uuid,
+            result=result,
+            admin=call.from_user.id,
+        )
+        await self._run_best_effort(
+            "refresh_message1",
+            self._refresh_message1(
+                status_key,
+                user=applicant_display,
+                user_id=applicant.id,
+                admin=admin_display,
+            ),
+        )
+        await self._run_best_effort(
+            "notify_applicant",
+            self._notify_applicant(private_key),
+        )
+        await self._run_best_effort(
+            "apply_join_result",
+            self._apply_join_result(result),
+        )
+        if ban_user:
+            await self._run_best_effort(
+                "ban_chat_member",
+                self.bot.ban_chat_member(chat_id=self.chat_id, user_id=self.user_id),
+            )
+        await self._edit_log_result(
+            status="Approved" if result else "Denied",
+            admin_id=call.from_user.id,
+            admin_name=call.from_user.full_name,
         )
 
     async def _notify_applicant(self, text_key: str):
@@ -312,18 +486,22 @@ class JoinRequestVote:
             types.InlineKeyboardButton("Ban", callback_data=f"jr {self.uuid} ban"),
         )
 
-        self.message1 = await self.bot.send_message(
-            chat_id=self.chat_id,
-            text=msg1_text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
+        self.message1 = await self._run_best_effort(
+            "send_message1",
+            self.bot.send_message(
+                chat_id=self.chat_id,
+                text=msg1_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            ),
         )
-        logger.debug(
-            "message1 sent uuid={} chat_id={} message_id={}",
-            self.uuid,
-            self.chat_id,
-            self.message1.message_id,
-        )
+        if self.message1:
+            logger.debug(
+                "message1 sent uuid={} chat_id={} message_id={}",
+                self.uuid,
+                self.chat_id,
+                self.message1.message_id,
+            )
         await self._send_pending_log()
 
         if self.advanced_vote_enabled:
@@ -331,9 +509,13 @@ class JoinRequestVote:
                 self.message2 = await self.bot.send_message(
                     chat_id=self.chat_id,
                     text=t(self.language, "jr_poll_question"),
-                    reply_to_message_id=self.message1.message_id,
                     reply_markup=await self._build_advanced_vote_keyboard(),
                     protect_content=True,
+                    **(
+                        {"reply_to_message_id": self.message1.message_id}
+                        if self.message1
+                        else {}
+                    ),
                 )
                 logger.debug(
                     "advanced message2 sent uuid={} chat_id={} message_id={}",
@@ -361,7 +543,11 @@ class JoinRequestVote:
                     is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
                     protect_content=True,
                     allows_multiple_answers=False,
-                    reply_to_message_id=self.message1.message_id,
+                    **(
+                        {"reply_to_message_id": self.message1.message_id}
+                        if self.message1
+                        else {}
+                    ),
                 )
                 logger.debug(
                     "poll message2 sent uuid={} chat_id={} message_id={}",
@@ -380,9 +566,13 @@ class JoinRequestVote:
                     self.message2 = await self.bot.send_message(
                         chat_id=self.chat_id,
                         text=t(self.language, "jr_poll_question"),
-                        reply_to_message_id=self.message1.message_id,
                         reply_markup=await self._build_advanced_vote_keyboard(),
                         protect_content=True,
+                        **(
+                            {"reply_to_message_id": self.message1.message_id}
+                            if self.message1
+                            else {}
+                        ),
                     )
                     logger.warning(
                         "poll fallback activated, advanced message2 sent uuid={} chat_id={} message_id={}",
@@ -459,7 +649,7 @@ class JoinRequestVote:
         except asyncio.TimeoutError:
             pass
 
-        waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
+        waiting = await self._safe_get_join_request_waiting()
         if waiting is not True:
             logger.debug(
                 "join request already resolved before timeout uuid={}", self.uuid
@@ -512,24 +702,31 @@ class JoinRequestVote:
         )
 
         if total_votes < min_voters:
-            self.message4 = await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=t(self.language, "jr_not_enough_voters"),
-                reply_to_message_id=self.message1.message_id,
+            self.message4 = await self._safe_send_group_message(
+                t(self.language, "jr_not_enough_voters")
             )
-            await self._refresh_message1(
-                "jr_status_not_enough_voters",
-                user=applicant_display,
-                user_id=applicant.id,
+            await self._run_best_effort(
+                "refresh_message1",
+                self._refresh_message1(
+                    "jr_status_not_enough_voters",
+                    user=applicant_display,
+                    user_id=applicant.id,
+                ),
             )
-            await self._notify_applicant("jr_no_votes_private")
-            await BotDatabase.update_join_request(
+            await self._run_best_effort(
+                "notify_applicant",
+                self._notify_applicant("jr_no_votes_private"),
+            )
+            await self._safe_update_join_request(
                 uuid=self.uuid,
                 result=False,
                 yes_votes=yes_votes,
                 no_votes=no_votes,
             )
-            await self._apply_join_result(False)
+            await self._run_best_effort(
+                "apply_join_result",
+                self._apply_join_result(False),
+            )
             await self._edit_log_result(
                 status="Denied",
                 yes_votes=yes_votes,
@@ -552,30 +749,16 @@ class JoinRequestVote:
                 private_key = "jr_private_rejected"
                 approved = False
 
-            self.message4 = await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=t(self.language, group_key),
-                reply_to_message_id=self.message1.message_id,
-            )
-            await self._refresh_message1(
-                status_key,
-                user=applicant_display,
-                user_id=applicant.id,
-            )
-            await self._notify_applicant(private_key)
-            if self.group_settings.get("pin_msg", False) and self.message2:
-                await self._safe_unpin_message(self.message2.message_id)
-            await BotDatabase.update_join_request(
-                uuid=self.uuid,
-                result=approved,
+            await self._finalize_vote_result(
+                applicant,
+                applicant_display,
+                group_text_key=group_key,
+                status_key=status_key,
+                private_key=private_key,
+                approved=approved,
                 yes_votes=yes_votes,
                 no_votes=no_votes,
-            )
-            await self._apply_join_result(approved)
-            await self._edit_log_result(
-                status="Approved" if approved else "Denied",
-                yes_votes=yes_votes,
-                no_votes=no_votes,
+                unpin_message2=bool(self.group_settings.get("pin_msg", False)),
             )
 
         await asyncio.sleep(60)
@@ -587,86 +770,46 @@ class JoinRequestVote:
 
     async def handle_action(self, call: types.CallbackQuery, action: str):
         if not await self._check_invite_permission(call.from_user.id):
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text=t(self.language, "insufficient_permissions"),
                 show_alert=True,
             )
             return
 
-        waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
+        waiting = await self._safe_get_join_request_waiting()
         if not waiting:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Expired",
                 show_alert=False,
             )
             return
 
-        admin_display = self._admin_display(call.from_user)
-        applicant = self.request.from_user
-        applicant_display = self._user_display(applicant)
-
         if action == "approve":
-            await BotDatabase.update_join_request(
-                uuid=self.uuid,
+            await self._finalize_admin_action(
+                call,
                 result=True,
-                admin=call.from_user.id,
-            )
-            await self._refresh_message1(
-                "jr_status_admin_approved",
-                user=applicant_display,
-                user_id=applicant.id,
-                admin=admin_display,
-            )
-            await self._notify_applicant("jr_private_approved")
-            await self._apply_join_result(True)
-            await self._edit_log_result(
-                status="Approved",
-                admin_id=call.from_user.id,
-                admin_name=call.from_user.full_name,
+                status_key="jr_status_admin_approved",
+                private_key="jr_private_approved",
             )
         elif action == "reject":
-            await BotDatabase.update_join_request(
-                uuid=self.uuid,
+            await self._finalize_admin_action(
+                call,
                 result=False,
-                admin=call.from_user.id,
-            )
-            await self._refresh_message1(
-                "jr_status_admin_rejected",
-                user=applicant_display,
-                user_id=applicant.id,
-                admin=admin_display,
-            )
-            await self._notify_applicant("jr_private_rejected")
-            await self._apply_join_result(False)
-            await self._edit_log_result(
-                status="Denied",
-                admin_id=call.from_user.id,
-                admin_name=call.from_user.full_name,
+                status_key="jr_status_admin_rejected",
+                private_key="jr_private_rejected",
             )
         elif action == "ban":
-            await BotDatabase.update_join_request(
-                uuid=self.uuid,
+            await self._finalize_admin_action(
+                call,
                 result=False,
-                admin=call.from_user.id,
-            )
-            await self._refresh_message1(
-                "jr_status_admin_banned",
-                user=applicant_display,
-                user_id=applicant.id,
-                admin=admin_display,
-            )
-            await self._notify_applicant("jr_private_rejected")
-            await self._apply_join_result(False)
-            await self.bot.ban_chat_member(chat_id=self.chat_id, user_id=self.user_id)
-            await self._edit_log_result(
-                status="Denied",
-                admin_id=call.from_user.id,
-                admin_name=call.from_user.full_name,
+                status_key="jr_status_admin_banned",
+                private_key="jr_private_rejected",
+                ban_user=True,
             )
         else:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Unsupported action",
             )
@@ -679,33 +822,33 @@ class JoinRequestVote:
         if self.message2:
             await self._safe_delete_message(self.chat_id, self.message2.message_id)
 
-        await self.bot.answer_callback_query(callback_query_id=call.id, text="Done")
+        await self._safe_answer_callback_query(callback_query_id=call.id, text="Done")
 
     async def handle_vote(self, call: types.CallbackQuery, option: str):
         if not self.advanced_vote_enabled:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Expired",
             )
             return
 
-        waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
+        waiting = await self._safe_get_join_request_waiting()
         if waiting is not True:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Expired",
             )
             return
 
         if option not in {"yes", "no"}:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Invalid vote",
             )
             return
 
         if not await self._is_group_member(call.from_user.id):
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text=t(self.language, "insufficient_permissions"),
                 show_alert=True,
@@ -714,7 +857,7 @@ class JoinRequestVote:
 
         async with self._vote_lock:
             if self._has_voted(call.from_user.id):
-                await self.bot.answer_callback_query(
+                await self._safe_answer_callback_query(
                     callback_query_id=call.id,
                     text=t(self.language, "jr_already_voted"),
                     show_alert=True,
@@ -727,15 +870,17 @@ class JoinRequestVote:
             else:
                 self._no_voters[call.from_user.id] = full_name
 
-        await self.bot.answer_callback_query(
+        await self._safe_answer_callback_query(
             callback_query_id=call.id,
             text=t(self.language, "jr_vote_recorded"),
         )
 
     async def handle_realtime_result_request(self, message: types.Message):
-        waiting = await BotDatabase.get_join_request_waiting_by_uuid(self.uuid)
+        waiting = await self._safe_get_join_request_waiting()
         if waiting is not True:
-            await self.bot.reply_to(message, "Expired")
+            await self._run_best_effort(
+                "reply_expired", self.bot.reply_to(message, "Expired")
+            )
             return
 
         user_id = message.from_user.id if message.from_user else None
@@ -743,14 +888,20 @@ class JoinRequestVote:
             return
 
         if not await self._is_group_member(user_id):
-            await self.bot.reply_to(
-                message, t(self.language, "insufficient_permissions")
+            await self._run_best_effort(
+                "reply_insufficient_permissions",
+                self.bot.reply_to(
+                    message, t(self.language, "insufficient_permissions")
+                ),
             )
             return
 
         async with self._vote_lock:
             if not self._has_voted(user_id):
-                await self.bot.reply_to(message, t(self.language, "jr_not_voted"))
+                await self._run_best_effort(
+                    "reply_not_voted",
+                    self.bot.reply_to(message, t(self.language, "jr_not_voted")),
+                )
                 return
 
             yes_votes = len(self._yes_voters)
@@ -775,20 +926,22 @@ class JoinRequestVote:
                     no_names=no_names,
                 )
 
-        await self.bot.reply_to(message, text)
+        await self._run_best_effort(
+            "reply_realtime_result", self.bot.reply_to(message, text)
+        )
 
     async def handle_status_query(self, call: types.CallbackQuery):
         if call.from_user.id != self.user_id:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text=t(self.language, "insufficient_permissions"),
                 show_alert=True,
             )
             return
 
-        status = await BotDatabase.get_join_request_status_by_uuid(self.uuid)
+        status = await self._safe_get_join_request_status()
         if status is None:
-            await self.bot.answer_callback_query(
+            await self._safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Expired",
             )
@@ -798,7 +951,7 @@ class JoinRequestVote:
             waiting=bool(status.get("waiting", False)),
             result=status.get("result"),
         )
-        await self.bot.answer_callback_query(
+        await self._safe_answer_callback_query(
             callback_query_id=call.id,
             text=t(self.language, "jr_status_query", status=label),
             show_alert=True,
