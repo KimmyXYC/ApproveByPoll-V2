@@ -1,12 +1,13 @@
 """Asynchronous SQLite storage with the same interface as PostgreSQL."""
 
 from pathlib import Path
+import re
 from uuid import UUID
 
 import aiosqlite
 from loguru import logger
 
-from utils.database_defaults import DEFAULT_GROUP_SETTINGS
+from utils.database_defaults import DEFAULT_GROUP_SETTINGS, MIN_VOTE_TIME, MAX_VOTE_TIME
 from utils.recovery_store import RecoveryStore, ReentrantLock, serialized
 
 
@@ -51,11 +52,11 @@ class AsyncSQLiteDB:
 
     @serialized
     async def ensure_tables_exist(self):
-        async with self.conn.executescript("""
+        async with self.conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS setting (
                 group_id INTEGER PRIMARY KEY,
                 vote_to_join BOOLEAN NOT NULL DEFAULT TRUE,
-                vote_time INTEGER NOT NULL DEFAULT 600 CHECK (vote_time BETWEEN 30 AND 3600),
+                vote_time INTEGER NOT NULL DEFAULT 600 CHECK (vote_time BETWEEN {MIN_VOTE_TIME} AND {MAX_VOTE_TIME}),
                 pin_msg BOOLEAN NOT NULL DEFAULT FALSE,
                 clean_pinned_message BOOLEAN NOT NULL DEFAULT FALSE,
                 anonymous_vote BOOLEAN NOT NULL DEFAULT TRUE,
@@ -76,6 +77,44 @@ class AsyncSQLiteDB:
             );
         """):
             pass
+        await self._upgrade_vote_time_limit()
+
+    async def _upgrade_vote_time_limit(self):
+        # SQLite cannot alter a CHECK constraint. Rebuild only the legacy table,
+        # preserving its data and user-defined indexes/triggers in one transaction.
+        async with self.conn.execute("BEGIN IMMEDIATE"):
+            pass
+        try:
+            async with self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'setting'"
+            ) as cursor:
+                schema = (await cursor.fetchone())["sql"]
+            upgraded, count = re.subn(
+                r"\bvote_time\s+BETWEEN\s+30\s+AND\s+3600\b",
+                f"vote_time BETWEEN {MIN_VOTE_TIME} AND {MAX_VOTE_TIME}",
+                schema,
+                flags=re.IGNORECASE,
+            )
+            if count:
+                async with self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE tbl_name = 'setting' AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+                ) as cursor:
+                    extras = await cursor.fetchall()
+                statements = [
+                    "CREATE TABLE setting_vote_time_upgrade ("
+                    + upgraded.split("(", 1)[1],
+                    "INSERT INTO setting_vote_time_upgrade SELECT * FROM setting",
+                    "DROP TABLE setting",
+                    "ALTER TABLE setting_vote_time_upgrade RENAME TO setting",
+                    *(row["sql"] for row in extras),
+                ]
+                for statement in statements:
+                    async with self.conn.execute(statement):
+                        pass
+            await self.conn.commit()
+        except BaseException:
+            await self.conn.rollback()
+            raise
 
     @serialized
     async def get_group_settings(self, group_id: int) -> dict:

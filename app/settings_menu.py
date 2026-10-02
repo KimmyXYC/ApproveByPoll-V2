@@ -4,6 +4,8 @@ from telebot import types
 
 from utils.i18n import LANGUAGE_LABELS, normalize_language_code, t
 from utils.database import BotDatabase
+from utils.database_defaults import MIN_VOTE_TIME, MAX_VOTE_TIME
+from utils.duration import format_duration as _format_vote_time
 
 TOGGLE_ITEMS = [
     "vote_to_join",
@@ -12,7 +14,24 @@ TOGGLE_ITEMS = [
     "clean_pinned_message",
     "advanced_vote",
 ]
-VOTE_TIME_OPTIONS = [60, 120, 300, 600, 900, 1200, 1800, 2700, 3600]
+VOTE_TIME_OPTIONS = [
+    60,
+    120,
+    300,
+    600,
+    900,
+    1200,
+    1800,
+    2700,
+    3600,
+    6 * 3600,
+    12 * 3600,
+    86400,
+    3 * 86400,
+    7 * 86400,
+    14 * 86400,
+    MAX_VOTE_TIME,
+]
 MINI_VOTERS_OPTIONS = [1, 2, 3, 5, 10, 20, 50, 100, 200]
 
 
@@ -59,22 +78,6 @@ async def _bot_can_pin_messages(bot, chat_id: int) -> bool:
         return False
 
 
-def _format_vote_time(language: str, seconds: int) -> str:
-    seconds = max(int(seconds), 0)
-    minutes = seconds // 60
-    remain_seconds = seconds % 60
-    if minutes and remain_seconds:
-        return t(
-            language,
-            "setting_vote_duration_min_sec",
-            minutes=minutes,
-            seconds=remain_seconds,
-        )
-    if minutes:
-        return t(language, "setting_vote_duration_minutes", minutes=minutes)
-    return t(language, "setting_vote_duration_seconds", seconds=remain_seconds)
-
-
 def _parse_int(value: str) -> int | None:
     try:
         return int(value)
@@ -88,18 +91,16 @@ def _parse_time_seconds(value: str) -> int | None:
         return direct_int
 
     normalized = value.strip().lower()
-    match = re.fullmatch(r"(?:(\d+)m)?(?:(\d+)s)?", normalized)
+    match = re.fullmatch(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", normalized)
     if not match:
         return None
 
-    minute_part = match.group(1)
-    second_part = match.group(2)
-    if minute_part is None and second_part is None:
+    if not any(match.groups()):
         return None
-
-    minutes = int(minute_part) if minute_part is not None else 0
-    seconds = int(second_part) if second_part is not None else 0
-    return minutes * 60 + seconds
+    return sum(
+        int(part or 0) * size
+        for part, size in zip(match.groups(), (86400, 3600, 60, 1))
+    )
 
 
 async def _handle_setting_command_with_args(
@@ -131,7 +132,7 @@ async def _handle_setting_command_with_args(
         if parsed_value is None:
             await bot.reply_to(message, t(language, "setting_invalid_integer"))
             return True
-        if not 30 <= parsed_value <= 3600:
+        if not MIN_VOTE_TIME <= parsed_value <= MAX_VOTE_TIME:
             await bot.reply_to(message, t(language, "setting_time_out_of_range"))
             return True
         await BotDatabase.update_group_setting(
@@ -251,8 +252,7 @@ def build_vote_time_keyboard(group_settings: dict) -> types.InlineKeyboardMarkup
 
     buttons = []
     for option in VOTE_TIME_OPTIONS:
-        minutes = option // 60
-        label = f"{minutes}min"
+        label = _format_vote_time(language, option)
         if option == current_vote_time:
             label = f"✅ {label}"
         buttons.append(

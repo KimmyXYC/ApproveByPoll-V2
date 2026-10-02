@@ -114,7 +114,7 @@ if missing. `database_setup.sql` is only for manual PostgreSQL setup.
 
 - `/help` - Show help information.
 - `/setting` - Open group settings panel.
-- `/setting time <seconds|10m30s>` - Set vote duration (`30-3600` seconds).
+- `/setting time <seconds|10m30s|2h|30d>` - Set vote duration (30 seconds to 30 days, up to `2592000` seconds).
 - `/setting voter <count>` - Set minimum voters (`1-500`).
 - `/setting mini_voters <count>` - Alias for `voter`.
 
@@ -231,7 +231,10 @@ bot/database**. The recovery database is bound to the Telegram bot ID at startup
 do not reuse it for another bot token's identity.
 
 - Voting keeps its original deadline and the group settings captured when the
-  request was created. Restarting does not extend voting time.
+  request was created. Restarting does not extend voting time. Both voting modes
+  support up to 30 days; the settings menu includes day/week presets, and
+  `/setting time 30d` selects the maximum. Existing database constraints are
+  upgraded automatically without changing saved settings or active deadlines.
 - Advanced votes are committed before the bot acknowledges them. The original
   voter identity, option and name survive a restart; repeat votes are rejected.
   A vote must first reach the durable inbox **before** the deadline. A button click
@@ -241,7 +244,9 @@ do not reuse it for another bot token's identity.
   stopped again, the bot temporarily updates its administrator controls to read
   the full Poll returned in the edited Message, then immediately clears those
   controls. Native polls have no result-query button. Missing final totals never
-  count as zero votes.
+  count as zero votes. For votes longer than 48 hours, Telegram may refuse to
+  delete the original message at cleanup; the poll is still closed and its
+  confirmed approval result is retained.
 - Approvals, rejections and bans are recorded as successful only after the API
   result is confirmed. Pending decisions, result notifications, unpinning and the
   60-second message cleanup continue after restart.

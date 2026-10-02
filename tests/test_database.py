@@ -47,7 +47,7 @@ class DatabaseContract:
             await self.db.update_group_setting(-1, "language = 'x'; --", True)
         for key, value in [
             ("vote_time", 29),
-            ("vote_time", 3601),
+            ("vote_time", 2592001),
             ("mini_voters", 0),
             ("mini_voters", 501),
         ]:
@@ -60,6 +60,69 @@ class DatabaseContract:
         self.assertEqual((await self.db.get_group_settings(-1))["mini_voters"], 500)
         self.assertTrue(await self.db.update_group_setting(-2, "vote_time", 30))
         self.assertEqual((await self.db.get_group_settings(-2))["vote_time"], 30)
+        for value in (3601, 86400, 2592000):
+            self.assertTrue(await self.db.update_group_setting(-2, "vote_time", value))
+            self.assertEqual((await self.db.get_group_settings(-2))["vote_time"], value)
+
+    async def test_legacy_vote_limit_upgrade_preserves_data_and_is_idempotent(self):
+        await self.db.update_group_setting(-1, "vote_time", 3600)
+        await self.db.update_group_setting(-1, "language", "zh_CN")
+        request_id = str(uuid4())
+        await self.db.create_join_request(request_id, -1, 77)
+        if self.db.recovery.postgres:
+            async with self.db.conn.acquire() as connection:
+                await connection.execute(
+                    "ALTER TABLE setting DROP CONSTRAINT setting_vote_time_check, ADD CONSTRAINT setting_vote_time_check CHECK (vote_time BETWEEN 30 AND 3600)"
+                )
+                await connection.execute(
+                    "CREATE INDEX setting_language_test ON setting(language)"
+                )
+        else:
+            async with self.db.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'setting'"
+            ) as cursor:
+                schema = (await cursor.fetchone())["sql"].replace("2592000", "3600")
+            await self.db.conn.executescript(
+                "BEGIN IMMEDIATE; CREATE TABLE legacy_setting ("
+                + schema.split("(", 1)[1]
+                + ";"
+                "INSERT INTO legacy_setting SELECT * FROM setting; DROP TABLE setting;"
+                "ALTER TABLE legacy_setting RENAME TO setting;"
+                "CREATE INDEX setting_language_test ON setting(language);"
+                "CREATE TABLE setting_audit(value INTEGER);"
+                "CREATE TRIGGER setting_audit_test AFTER UPDATE ON setting BEGIN INSERT INTO setting_audit VALUES (NEW.vote_time); END; COMMIT;"
+            )
+        with self.assertRaises((sqlite3.IntegrityError, asyncpg.CheckViolationError)):
+            await self.db.update_group_setting(-1, "vote_time", 3601)
+        await self.db.close()
+        await self.db.connect()
+        await self.db.ensure_tables_exist()
+        saved = await self.db.get_group_settings(-1)
+        self.assertEqual(saved["vote_time"], 3600)
+        self.assertEqual(saved["language"], "zh_CN")
+        self.assertTrue(
+            (await self.db.get_join_request_status_by_uuid(request_id))["waiting"]
+        )
+        await self.db.update_group_setting(-1, "vote_time", 2592000)
+        await self.db.close()
+        await self.db.connect()
+        self.assertEqual((await self.db.get_group_settings(-1))["vote_time"], 2592000)
+        if self.db.recovery.postgres:
+            async with self.db.conn.acquire() as connection:
+                self.assertIsNotNone(
+                    await connection.fetchval(
+                        "SELECT to_regclass('setting_language_test')"
+                    )
+                )
+        else:
+            async with self.db.conn.execute(
+                "SELECT value FROM setting_audit"
+            ) as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 2592000)
+            async with self.db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'setting_language_test'"
+            ) as cursor:
+                self.assertIsNotNone(await cursor.fetchone())
 
     async def test_request_lifecycle_and_missing_rows(self):
         request_id = str(uuid4())

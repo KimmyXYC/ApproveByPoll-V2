@@ -6,6 +6,7 @@ from telebot import types
 
 from app.recovery_operations import PollUnavailable, Rejected, member_present
 from utils.i18n import t
+from utils.duration import format_duration
 
 
 def keyboard(buttons):
@@ -220,7 +221,9 @@ class JoinRequestVote:
             self.text(
                 "jr_apply_notice",
                 group_name=task.get("chat_title") or str(task["group_id"]),
-                vote_minutes=max(1, task["settings"].get("vote_time", 600) // 60),
+                duration=format_duration(
+                    self.language, task["settings"].get("vote_time", 600)
+                ),
             ),
             reply_markup=keyboard(
                 [(self.text("jr_check_status"), f"jrs {task['uuid']}")]

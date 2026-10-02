@@ -30,7 +30,9 @@ async def listen_help_command(bot, message: types.Message):
         formatting.mcite("/help - Show help information"),
         formatting.mcite("/setting - Open the group settings panel"),
         formatting.mcite("/recover - Recover interrupted join requests"),
-        formatting.mcite("/setting time 600 - Set vote duration (30-3600 seconds)"),
+        formatting.mcite(
+            "/setting time 30d - Set vote duration (30 seconds to 30 days)"
+        ),
         formatting.mcite(
             "/setting voter 15 or /setting mini_voters 15 - Set minimum voters (1-500)"
         ),

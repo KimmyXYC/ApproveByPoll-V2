@@ -6,7 +6,7 @@
 import asyncpg
 from loguru import logger
 from app_conf import settings
-from utils.database_defaults import DEFAULT_GROUP_SETTINGS
+from utils.database_defaults import DEFAULT_GROUP_SETTINGS, MIN_VOTE_TIME, MAX_VOTE_TIME
 from utils.recovery_store import RecoveryStore
 
 
@@ -75,11 +75,11 @@ class AsyncPostgresDB:
         try:
             async with self.conn.acquire() as connection:
                 # Create setting table if it doesn't exist
-                await connection.execute("""
+                await connection.execute(f"""
                     CREATE TABLE IF NOT EXISTS setting (
                         group_id BIGINT PRIMARY KEY,
                         vote_to_join BOOLEAN NOT NULL DEFAULT TRUE,
-                        vote_time INTEGER NOT NULL DEFAULT 600 CHECK (vote_time BETWEEN 30 AND 3600),
+                        vote_time INTEGER NOT NULL DEFAULT 600 CHECK (vote_time BETWEEN {MIN_VOTE_TIME} AND {MAX_VOTE_TIME}),
                         pin_msg BOOLEAN NOT NULL DEFAULT FALSE,
                         clean_pinned_message BOOLEAN NOT NULL DEFAULT FALSE,
                         anonymous_vote BOOLEAN NOT NULL DEFAULT TRUE,
@@ -88,6 +88,16 @@ class AsyncPostgresDB:
                         mini_voters INTEGER NOT NULL DEFAULT 3 CHECK (mini_voters BETWEEN 1 AND 500)
                     )
                 """)
+
+                async with connection.transaction():
+                    constraint = await connection.fetchval(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'setting'::regclass AND conname = 'setting_vote_time_check'"
+                    )
+                    if constraint and "3600" in constraint:
+                        await connection.execute(
+                            "ALTER TABLE setting DROP CONSTRAINT setting_vote_time_check, "
+                            f"ADD CONSTRAINT setting_vote_time_check CHECK (vote_time BETWEEN {MIN_VOTE_TIME} AND {MAX_VOTE_TIME})"
+                        )
 
                 # Create join_request table if it doesn't exist
                 await connection.execute("""

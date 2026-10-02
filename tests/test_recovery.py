@@ -176,6 +176,67 @@ class RecoveryContract:
         self.manager = RecoveryManager(self.bot, self.db, {}, self.clock)
         self.bot.manager = self.manager
 
+    async def test_month_long_votes_keep_original_deadline_across_restart(self):
+        for index, advanced in enumerate((False, True), start=1):
+            with self.subTest(advanced=advanced):
+                await self.db.update_group_setting(
+                    request().chat.id, "advanced_vote", advanced
+                )
+                await self.db.update_group_setting(
+                    request().chat.id, "vote_time", 2592000
+                )
+                await self.db.update_group_setting(request().chat.id, "mini_voters", 1)
+                self.manager.update_id = index
+                self.manager.received_at = self.clock()
+                self.bot.members[request().from_user.id] = "left"
+                await self.manager.create(request())
+                task = next(
+                    task
+                    for task in await self.store.tasks()
+                    if task["phase"] == "preparing"
+                )
+                await self.manager.tick()
+                await self.manager.tick()  # Finish pin/applicant notification setup.
+                task = await self.store.get(task["uuid"])
+                deadline = self.clock() + 2592000
+                self.assertEqual(task["deadline"], deadline)
+                if advanced:
+                    await self.store.vote(
+                        task["uuid"], 77, "Voter", "yes", deadline - 1
+                    )
+                else:
+                    params = next(
+                        params
+                        for method, params in reversed(self.bot.calls)
+                        if method == "send_poll"
+                    )
+                    self.assertEqual(params["close_date"], deadline)
+                refs = task["refs"].copy()
+                sends = self.bot.count("send_poll") + self.bot.count("send_message")
+                await self.db.update_group_setting(task["group_id"], "vote_time", 60)
+                await self.reboot()
+                self.clock.now = deadline - 1
+                await self.manager.tick()
+                task = await self.store.get(task["uuid"])
+                self.assertEqual(task["phase"], "voting")
+                self.assertEqual(task["deadline"], deadline)
+                self.assertEqual(task["refs"], refs)
+                self.assertEqual(
+                    self.bot.count("send_poll") + self.bot.count("send_message"), sends
+                )
+                self.clock.now = deadline
+                await self.manager.tick()
+                await self.manager.tick()
+                self.assertIs(
+                    (await self.db.get_join_request_status_by_uuid(task["uuid"]))[
+                        "result"
+                    ],
+                    True,
+                )
+                self.clock.now += 60
+                await self.manager.tick()
+                self.assertEqual((await self.store.get(task["uuid"]))["phase"], "done")
+
     async def test_advanced_votes_deadline_settings_and_cleanup_survive(self):
         task = await self.new_task()
         uuid = task["uuid"]

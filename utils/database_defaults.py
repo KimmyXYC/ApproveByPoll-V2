@@ -1,3 +1,6 @@
+MIN_VOTE_TIME = 30
+MAX_VOTE_TIME = 30 * 24 * 60 * 60
+
 DEFAULT_GROUP_SETTINGS = {
     "vote_to_join": True,
     "vote_time": 600,
