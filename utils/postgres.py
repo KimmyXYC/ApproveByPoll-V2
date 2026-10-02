@@ -6,26 +6,14 @@
 import asyncpg
 from loguru import logger
 from app_conf import settings
+from utils.database_defaults import DEFAULT_GROUP_SETTINGS
 
 
 class AsyncPostgresDB:
-    DEFAULT_GROUP_SETTINGS = {
-        "vote_to_join": True,
-        "vote_time": 600,
-        "pin_msg": False,
-        "clean_pinned_message": False,
-        "anonymous_vote": True,
-        "advanced_vote": False,
-        "language": "en_US",
-        "mini_voters": 3,
-    }
+    DEFAULT_GROUP_SETTINGS = DEFAULT_GROUP_SETTINGS
 
-    def __init__(self):
-        self.host = settings.database.host
-        self.port = settings.database.port
-        self.dbname = settings.database.dbname
-        self.user = settings.database.user
-        self.password = settings.database.password
+    def __init__(self, config=None):
+        self.config = settings.get("database", {}) if config is None else config
         self.conn = None
 
     async def connect(self):
@@ -33,7 +21,14 @@ class AsyncPostgresDB:
         Connect to the PostgreSQL database using asyncpg.
         This method creates a connection pool for efficient database access.
         """
+        if self.conn is not None:
+            return
         try:
+            self.host = self.config["host"]
+            self.port = self.config["port"]
+            self.dbname = self.config["dbname"]
+            self.user = self.config["user"]
+            self.password = self.config["password"]
             self.conn = await asyncpg.create_pool(
                 host=self.host,
                 port=self.port,
@@ -48,6 +43,7 @@ class AsyncPostgresDB:
             )
             await self.ensure_tables_exist()
         except Exception as e:
+            await self.close()
             logger.error(f"Failed to connect to PostgreSQL database: {str(e)}")
             raise
 
@@ -59,7 +55,10 @@ class AsyncPostgresDB:
         :return: None
         """
         try:
+            if self.conn is None:
+                return
             await self.conn.close()
+            self.conn = None
             logger.info("PostgreSQL database connection closed successfully")
         except Exception as e:
             logger.error(f"Error closing PostgreSQL database connection: {str(e)}")
@@ -303,17 +302,7 @@ class AsyncPostgresDB:
         Update one allowed group setting field.
         Returns True if one row is updated.
         """
-        allowed_fields = {
-            "vote_to_join",
-            "vote_time",
-            "pin_msg",
-            "clean_pinned_message",
-            "anonymous_vote",
-            "advanced_vote",
-            "language",
-            "mini_voters",
-        }
-        if item not in allowed_fields:
+        if item not in self.DEFAULT_GROUP_SETTINGS:
             raise ValueError(f"Unsupported setting field: {item}")
 
         try:
@@ -330,6 +319,3 @@ class AsyncPostgresDB:
                 f"Error updating group setting for group_id={group_id}, item={item}: {str(e)}"
             )
             raise
-
-
-BotDatabase = AsyncPostgresDB()

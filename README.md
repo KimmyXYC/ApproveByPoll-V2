@@ -11,12 +11,12 @@ A Telegram bot that manages group join requests with voting workflows.
 - Multi-language support (`en_US`, `zh_CN`, `zh_TW`) with per-group language setting.
 - Group settings panel with inline controls and `/setting` command arguments.
 - Optional log channel updates (Pending -> Approved/Denied edit-in-place).
-- PostgreSQL storage for group settings and join request lifecycle.
+- PostgreSQL or SQLite storage for group settings and join request lifecycle.
 
 ## Requirements
 
 - Python `3.12+`
-- PostgreSQL `14+` (recommended 15/16)
+- PostgreSQL `14+` (recommended 15/16), or SQLite with no separate database server
 - Telegram Bot token
 
 ## Quick Start (Local)
@@ -58,6 +58,7 @@ enable = false
 api_server = "http://127.0.0.1:8081"
 
 [database]
+backend = "postgresql"
 host = "127.0.0.1"
 port = 5432
 user = "postgres"
@@ -72,6 +73,27 @@ message_thread_id = 0
 
 `message_thread_id = 0` means "do not use thread id".
 
+Choose the database with `database.backend`. Existing configurations without this
+field continue to use PostgreSQL. To use SQLite, replace the `[database]` section
+above with:
+
+```toml
+[database]
+backend = "sqlite"
+path = "data/approvebypoll.sqlite3"
+```
+
+SQLite does not require PostgreSQL connection settings. The database file and its
+parent directories are created automatically. Relative paths are resolved from
+the bot's working directory; the default path is `data/approvebypoll.sqlite3`.
+The bot needs write permission to that directory. SQLite timestamps are stored
+as UTC text, and writes are committed automatically.
+
+Environment variables `DYNACONF_DATABASE__BACKEND` and `DYNACONF_DATABASE__PATH`
+can also select the backend and SQLite path when exported before starting the bot.
+Switching backends does not migrate existing data; each database retains its own
+group settings and join request history.
+
 ### 3) App settings (`conf_dir/settings.toml`)
 
 ```toml
@@ -85,7 +107,8 @@ debug = false
 python main.py
 ```
 
-On startup, the bot connects to PostgreSQL and creates required tables if missing.
+On startup, the bot connects to the selected database and creates required tables
+if missing. `database_setup.sql` is only for manual PostgreSQL setup.
 
 ## Commands
 
@@ -108,6 +131,8 @@ docker build -t approvebypoll-v2:local .
 1. Copy and edit config files:
    - `.env.exp` -> `.env`
    - `conf_dir/.secrets.toml.exp` -> `conf_dir/.secrets.toml`
+   - For the bundled PostgreSQL service, set `backend = "postgresql"`,
+     `host = "postgres"`, and `user`, `password`, and `dbname` to `"approvebypoll"`.
 2. Start:
 
 ```bash
@@ -125,6 +150,21 @@ docker compose logs -f bot
 ```bash
 docker compose down
 ```
+
+### Run with SQLite (no PostgreSQL service)
+
+Prepare the same config files, then use the standalone SQLite Compose file:
+
+```bash
+docker compose -f docker-compose.sqlite.yml up -d --build
+docker compose -f docker-compose.sqlite.yml logs -f bot
+docker compose -f docker-compose.sqlite.yml down
+```
+
+This file selects SQLite through environment variables and persists the database
+in the `sqlite_data` volume at `/app/data/approvebypoll.sqlite3`. The volume survives
+container recreation and `down`; `down -v` deletes it and its database.
+Stop an existing PostgreSQL bot container before switching Compose files.
 
 ## Systemd Service
 
@@ -181,6 +221,20 @@ Examples:
 - Keep `.env` and `conf_dir/.secrets.toml` out of Git.
 - For production, give the bot only required admin permissions.
 - If poll sending fails in your Telegram environment, the bot can fallback to advanced button voting mode.
+
+## Tests
+
+```bash
+uv sync --extra dev
+uv run pytest -q
+uv run ruff check .
+```
+
+SQLite tests use temporary database files. To also run the same storage tests
+against PostgreSQL, export `TEST_POSTGRES_DSN` (for example,
+`postgresql://postgres:password@127.0.0.1:5432/postgres`). The test role needs
+permission to create databases; each test creates and removes its own `abp_test_*`
+database without modifying existing tables.
 
 ## License
 

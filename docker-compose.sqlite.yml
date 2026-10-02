@@ -1,0 +1,20 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/kimmyxyc/approvebypoll-v2:latest
+    container_name: approvebypoll-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DYNACONF_DATABASE__BACKEND: sqlite
+      DYNACONF_DATABASE__PATH: /app/data/approvebypoll.sqlite3
+    volumes:
+      - ./conf_dir/settings.toml:/app/conf_dir/settings.toml:ro
+      - ./conf_dir/.secrets.toml:/app/conf_dir/.secrets.toml:ro
+      - sqlite_data:/app/data
+
+volumes:
+  sqlite_data:

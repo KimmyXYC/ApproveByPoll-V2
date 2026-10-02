@@ -20,7 +20,7 @@ from app.utils import generate_uuid
 from app.settings_menu import handle_settings_callback, open_settings
 from utils.i18n import normalize_language_code, t
 from utils.join_request_store import JoinRequestSessionStore
-from utils.postgres import BotDatabase
+from utils.database import BotDatabase
 
 StepCache = StateMemoryStorage()
 

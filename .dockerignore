@@ -17,3 +17,7 @@ conf_dir/.secrets.toml
 .env
 .env.*
 !.env.exp
+data
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

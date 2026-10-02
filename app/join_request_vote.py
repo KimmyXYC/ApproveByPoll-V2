@@ -7,7 +7,7 @@ from telebot import types
 from app_conf import settings
 from setting.telegrambot import BotSetting
 from utils.i18n import t
-from utils.postgres import BotDatabase
+from utils.database import BotDatabase
 
 
 class JoinRequestVote:

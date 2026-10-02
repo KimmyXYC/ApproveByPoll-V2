@@ -26,7 +26,8 @@ RUN pip install --upgrade pip \
     "dynaconf>=3.2.4" \
     "frozenlist>=1.3.4" \
     "pysocks>=1.7.1" \
-    "asyncpg>=0.31.0"
+    "asyncpg>=0.31.0" \
+    "aiosqlite>=0.20.0,<1.0.0"
 
 COPY app ./app
 COPY utils ./utils

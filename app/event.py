@@ -7,7 +7,7 @@ from telebot import formatting, types
 
 from app.settings_menu import handle_settings_callback, open_settings
 from setting.telegrambot import BotSetting
-from utils.postgres import BotDatabase
+from utils.database import BotDatabase
 
 
 async def set_bot_commands(bot):

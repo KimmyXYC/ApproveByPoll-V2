@@ -3,7 +3,7 @@ import re
 from telebot import types
 
 from utils.i18n import LANGUAGE_LABELS, normalize_language_code, t
-from utils.postgres import BotDatabase
+from utils.database import BotDatabase
 
 TOGGLE_ITEMS = [
     "vote_to_join",

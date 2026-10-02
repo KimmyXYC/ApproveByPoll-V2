@@ -6,7 +6,7 @@ from loguru import logger
 
 from app.controller import BotRunner
 from app_conf import settings
-from utils.postgres import BotDatabase
+from utils.database import BotDatabase
 
 load_dotenv()
 # 移除默认的日志处理器
@@ -28,8 +28,10 @@ logger.info("Log Is Secret, Please Don't Share It To Others")
 
 async def main():
     await BotDatabase.connect()
-    await BotDatabase.ensure_tables_exist()
-    await asyncio.gather(BotRunner().run())
+    try:
+        await BotRunner().run()
+    finally:
+        await BotDatabase.close()
 
 
 if __name__ == "__main__":
