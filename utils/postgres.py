@@ -7,6 +7,7 @@ import asyncpg
 from loguru import logger
 from app_conf import settings
 from utils.database_defaults import DEFAULT_GROUP_SETTINGS
+from utils.recovery_store import RecoveryStore
 
 
 class AsyncPostgresDB:
@@ -15,6 +16,7 @@ class AsyncPostgresDB:
     def __init__(self, config=None):
         self.config = settings.get("database", {}) if config is None else config
         self.conn = None
+        self.recovery = RecoveryStore(self, postgres=True)
 
     async def connect(self):
         """
@@ -42,6 +44,7 @@ class AsyncPostgresDB:
                 f"Successfully connected to PostgreSQL database at {self.host}:{self.port}/{self.dbname}"
             )
             await self.ensure_tables_exist()
+            await self.recovery.initialize()
         except Exception as e:
             await self.close()
             logger.error(f"Failed to connect to PostgreSQL database: {str(e)}")

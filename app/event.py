@@ -14,6 +14,7 @@ async def set_bot_commands(bot):
     commands = [
         types.BotCommand("help", "Help"),
         types.BotCommand("setting", "Group settings"),
+        types.BotCommand("recover", "Recover interrupted join requests"),
     ]
 
     await bot.set_my_commands(commands, scope=types.BotCommandScopeDefault())
@@ -28,6 +29,7 @@ async def listen_help_command(bot, message: types.Message):
         formatting.mbold("Commands"),
         formatting.mcite("/help - Show help information"),
         formatting.mcite("/setting - Open the group settings panel"),
+        formatting.mcite("/recover - Recover interrupted join requests"),
         formatting.mcite("/setting time 600 - Set vote duration (30-3600 seconds)"),
         formatting.mcite(
             "/setting voter 15 or /setting mini_voters 15 - Set minimum voters (1-500)"

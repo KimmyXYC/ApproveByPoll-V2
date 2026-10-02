@@ -222,6 +222,91 @@ Examples:
 - For production, give the bot only required admin permissions.
 - If poll sending fails in your Telegram environment, the bot can fallback to advanced button voting mode.
 
+## Restart recovery
+
+Both SQLite and PostgreSQL persist ongoing join requests automatically. No new
+configuration or external queue is needed. Use a persistent SQLite **file** (not
+`:memory:`), or a persistent PostgreSQL database, and run only **one instance per
+bot/database**. The recovery database is bound to the Telegram bot ID at startup;
+do not reuse it for another bot token's identity.
+
+- Voting keeps its original deadline and the group settings captured when the
+  request was created. Restarting does not extend voting time.
+- Advanced votes are committed before the bot acknowledges them. The original
+  voter identity, option and name survive a restart; repeat votes are rejected.
+  A vote must first reach the durable inbox **before** the deadline. A button click
+  first received after the deadline does not count, even if clicked while offline.
+- Native polls use Telegram's `close_date` and only confirmed, closed poll totals
+  are used for automatic decisions. If an automatically closed poll cannot be
+  stopped again, the bot temporarily updates its administrator controls to read
+  the full Poll returned in the edited Message, then immediately clears those
+  controls. Native polls have no result-query button. Missing final totals never
+  count as zero votes.
+- Approvals, rejections and bans are recorded as successful only after the API
+  result is confirmed. Pending decisions, result notifications, unpinning and the
+  60-second message cleanup continue after restart.
+- If an administrator approves through Telegram, a member-joined update closes
+  the vote and synchronizes the database. Membership is also checked before
+  settlement. Telegram does not send a dedicated rejection update: when an
+  approval/rejection call explicitly reports `HIDE_REQUESTER_MISSING`, membership
+  is checked and the request is closed as externally approved or ended with an
+  unknown outcome (`waiting = false`, `result = NULL`). It is never reported as a
+  successful bot rejection merely because the user is absent. A later, distinct
+  join request replaces the stale request atomically. External closure retains
+  history, cancels voting and runs the usual recoverable cleanup.
+- Telegram updates are committed locally before the receiving cursor advances.
+  Received updates are replayed in order. Telegram keeps undelivered updates for
+  at most 24 hours, so a longer outage can require manual recovery.
+
+### Administrator recovery
+
+Use `/recover` in the affected group to list requests requiring attention and
+show **Retry recovery**, **Approve**, **Reject**, and **Ban** buttons. The bot
+checks current administrator invite permissions and the originating group for
+each action. Applicant status queries distinguish pending, processing, recovery
+requiring attention, and confirmed results.
+
+Transient operations retry with exponential delays of 2–60 seconds, respecting
+Telegram's longer `retry_after`. Ten consecutive failures require administrator
+attention. Explicit retry resets that retry budget. Missing messages and failed
+auxiliary notifications do not reverse a confirmed approval/rejection.
+
+Telegram and the database cannot commit one atomic transaction. If a poll/message
+may have been sent but its returned ID was not committed, the bot does **not**
+blindly send another poll. Likewise, an uncertain rejection is not marked as
+successful. Such requests require administrator review. Retry can reconcile
+verifiable membership or recover a subsequently received final poll result, but
+it cannot reconstruct an unknown message ID. Administrators can explicitly choose
+a new approval/rejection/ban decision for requests whose application has not been
+confirmed; confirmed results can only resume their remaining cleanup.
+
+### Upgrade and operation
+
+1. Stop the old bot and back up its database before deploying this version. For
+   SQLite, stop all writers and use SQLite's backup command; do not copy only the
+   main file while WAL writes are active. For PostgreSQL, use `pg_dump`.
+2. Start the new version against the same database. Recovery tables and indexes
+   are created idempotently, without deleting existing settings/history.
+3. Check startup recovery counts and `/recover`. Old waiting requests lack the
+   required deadline, message and voter snapshots and therefore need manual
+   handling. Completed historical records remain unchanged. Full automatic
+   recovery applies to requests created by this version.
+
+Keep the database directory/volume across redeployments. On normal SIGTERM/SIGINT
+shutdown, update reception stops first and current work gets up to 10 seconds to
+finish before tasks are cancelled and the database is closed. An abrupt kill is
+covered by persisted operation states. Database failures stop processing rather
+than allowing Telegram actions to proceed without durable records.
+
+Successfully processed inbox bodies are deleted after 7 days; unprocessed/failed
+updates are retained. Task snapshots, voter names and operation records remain in
+the database alongside request history; protect it like the existing bot logs.
+The automated recovery suite uses both real database engines, simulated Telegram
+API failures, and subprocess SIGKILL tests. Live Telegram validation additionally
+requires a dedicated bot and test group; never run a second receiver beside an
+existing deployment.
+
+
 ## Tests
 
 ```bash

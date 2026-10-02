@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import signal
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -27,6 +28,10 @@ logger.info("Log Is Secret, Please Don't Share It To Others")
 
 
 async def main():
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, current.cancel)
     await BotDatabase.connect()
     try:
         await BotRunner().run()
@@ -35,4 +40,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass

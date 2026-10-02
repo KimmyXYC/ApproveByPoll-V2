@@ -1,958 +1,624 @@
-import asyncio
+"""A recoverable join-request state machine; no authoritative in-memory votes."""
+
 import html
 
-from loguru import logger
 from telebot import types
 
-from app_conf import settings
-from setting.telegrambot import BotSetting
+from app.recovery_operations import PollUnavailable, Rejected, member_present
 from utils.i18n import t
-from utils.database import BotDatabase
+
+
+def keyboard(buttons):
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        *(
+            types.InlineKeyboardButton(label, callback_data=data)
+            for label, data in buttons
+        )
+    )
+    return markup.to_json()
 
 
 class JoinRequestVote:
-    def __init__(
-        self, bot, request: types.ChatJoinRequest, uuid: str, group_settings: dict
-    ):
-        self.bot = bot
-        self.request = request
-        self.uuid = uuid
-        self.group_settings = group_settings
-        self.language = group_settings.get("language")
-        self.vote_time = int(group_settings.get("vote_time", 600))
-        self.advanced_vote_enabled = bool(group_settings.get("advanced_vote", False))
-        self.message1 = None
-        self.message2 = None
-        self.message3 = None
-        self.message4 = None
-        self._manual_resolved = asyncio.Event()
-        self._vote_lock = asyncio.Lock()
-        self._yes_voters: dict[int, str] = {}
-        self._no_voters: dict[int, str] = {}
-        self.log_message_id: int | None = None
+    def __init__(self, manager, task):
+        self.manager = manager
+        self.store = manager.store
+        self.bot = manager.bot
+        self.ops = manager.ops
+        self.task = task
 
-    def _log_step_failure(self, step: str):
-        logger.exception(
-            "join request step failed uuid={} chat_id={} user_id={} step={}",
-            self.uuid,
-            self.chat_id,
-            self.user_id,
-            step,
+    @property
+    def language(self):
+        return self.task.get("settings", {}).get("language", "en_US")
+
+    def text(self, key, **kwargs):
+        return t(self.language, key, **kwargs)
+
+    def applicant(self):
+        user = self.task.get("applicant", {})
+        name = html.escape(user.get("name") or str(self.task["user_id"]))
+        return f'<a href="tg://user?id={self.task["user_id"]}">{name}</a>'
+
+    async def save(self):
+        await self.store.save(self.task, self.manager.clock())
+
+    async def send(self, name, chat_id, text, *, core=False, **kwargs):
+        ref = await self.ops.call(
+            self.task,
+            name,
+            "send_message",
+            dict(chat_id=chat_id, text=text, **kwargs),
+            policy="core_send" if core else "aux_send",
+            optional=not core,
+        )
+        if ref:
+            self.task["refs"][name] = ref
+            await self.save()
+        return ref
+
+    async def edit(self, name, ref_name, text, **kwargs):
+        ref = self.task["refs"].get(ref_name)
+        if ref:
+            return await self.ops.call(
+                self.task,
+                f"{name}_{ref['chat_id']}_{ref['message_id']}",
+                "edit_message_text",
+                dict(
+                    chat_id=ref["chat_id"],
+                    message_id=ref["message_id"],
+                    text=text,
+                    **kwargs,
+                ),
+                optional=True,
+            )
+
+    def action_keyboard(self, recovery=False):
+        uid = self.task["uuid"]
+        buttons = [
+            (self.text("recover_approve"), f"jr {uid} approve"),
+            (self.text("recover_reject"), f"jr {uid} reject"),
+            (self.text("recover_ban"), f"jr {uid} ban"),
+        ]
+        if recovery and self.task.get("applied"):
+            buttons = []
+        markup = types.InlineKeyboardMarkup.de_json(keyboard(buttons))
+        if recovery:
+            markup.row(
+                types.InlineKeyboardButton(
+                    self.text("recover_retry"), callback_data=f"jr {uid} retry"
+                )
+            )
+        return markup.to_json()
+
+    def recovery_reason(self):
+        reason = self.task.get("error", "")
+        if self.task.get("legacy") or reason.startswith(
+            ("legacy", "corrupt", "invalid_task")
+        ):
+            return self.text("recover_reason_snapshot")
+        if reason.startswith(("uncertain_native_poll", "uncertain_advanced_poll")):
+            return self.text("recover_reason_delivery")
+        if "poll" in reason:
+            return self.text("recover_reason_poll")
+        if reason.startswith("uncertain_apply"):
+            return self.text("recover_reason_approval")
+        return self.text("recover_reason_api")
+
+    async def prepare(self):
+        task = self.task
+        if task.get("legacy"):
+            await self.ops.attention(task, "legacy_snapshot_missing")
+        await self.send(
+            "intro",
+            task["group_id"],
+            self.text("jr_requesting", user=self.applicant(), user_id=task["user_id"]),
+            parse_mode="HTML",
+            reply_markup=self.action_keyboard(),
+        )
+        log = task.get("log")
+        if log:
+            params = (
+                {"message_thread_id": log["thread_id"]} if log.get("thread_id") else {}
+            )
+            await self.send(
+                "log",
+                log["chat_id"],
+                self.log_text("Pending"),
+                parse_mode="HTML",
+                **params,
+            )
+        if "deadline" not in task:
+            task["deadline"] = int(self.manager.clock()) + task["settings"].get(
+                "vote_time", 600
+            )
+            await self.save()
+        ref = task["refs"].get("vote")
+        if not ref:
+            if task["deadline"] <= self.manager.clock():
+                name = "native_poll" if task["mode"] == "poll" else "advanced_poll"
+                operation = await self.store.operation(task["uuid"], name)
+                if not operation or operation["state"] == "pending":
+                    await self.ops.attention(task, "preparation_deadline_elapsed")
+            reply = task["refs"].get("intro")
+            params = dict(chat_id=task["group_id"], protect_content=True)
+            if reply:
+                params["reply_to_message_id"] = reply["message_id"]
+            if task["mode"] == "poll":
+                try:
+                    ref = await self.ops.call(
+                        task,
+                        "native_poll",
+                        "send_poll",
+                        dict(
+                            **params,
+                            question=self.text("jr_poll_question"),
+                            options=[self.text("jr_poll_yes"), self.text("jr_poll_no")],
+                            is_anonymous=task["settings"].get("anonymous_vote", True),
+                            allows_multiple_answers=False,
+                            close_date=int(task["deadline"]),
+                        ),
+                        policy="core_send",
+                    )
+                    task["poll_id"] = ref["poll_id"]
+                    task["poll"] = ref["poll"]
+                except Rejected:
+                    task["mode"] = "advanced"
+                    await self.save()
+            if task["mode"] == "advanced":
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                markup.add(
+                    types.InlineKeyboardButton(
+                        self.text("jr_poll_yes"),
+                        callback_data=f"jrv {task['uuid']} yes",
+                    ),
+                    types.InlineKeyboardButton(
+                        self.text("jr_poll_no"), callback_data=f"jrv {task['uuid']} no"
+                    ),
+                )
+                if self.manager.username:
+                    markup.add(
+                        types.InlineKeyboardButton(
+                            self.text("jr_live_result"),
+                            url=f"https://t.me/{self.manager.username}?start=jrres_{task['uuid']}",
+                        )
+                    )
+                ref = await self.ops.call(
+                    task,
+                    "advanced_poll",
+                    "send_message",
+                    dict(
+                        **params,
+                        text=self.text("jr_poll_question"),
+                        reply_markup=markup.to_json(),
+                    ),
+                    policy="core_send",
+                )
+            task["refs"]["vote"] = ref
+            await self.save()
+        task["phase"] = "voting"
+        await self.save()
+
+    async def voting_setup(self):
+        task = self.task
+        if task["settings"].get("pin_msg") and task["refs"].get("vote"):
+            ref = task["refs"]["vote"]
+            await self.ops.call(
+                task,
+                "pin",
+                "pin_chat_message",
+                dict(
+                    chat_id=ref["chat_id"],
+                    message_id=ref["message_id"],
+                    disable_notification=True,
+                ),
+                optional=True,
+            )
+        # A failed private message or pin must not restart the deadline.
+        await self.send(
+            "applicant",
+            task.get("user_chat_id", task["user_id"]),
+            self.text(
+                "jr_apply_notice",
+                group_name=task.get("chat_title") or str(task["group_id"]),
+                vote_minutes=max(1, task["settings"].get("vote_time", 600) // 60),
+            ),
+            reply_markup=keyboard(
+                [(self.text("jr_check_status"), f"jrs {task['uuid']}")]
+            ),
         )
 
-    async def _run_best_effort(self, step: str, coro, default=None):
-        try:
-            return await coro
-        except Exception:
-            self._log_step_failure(step)
-            return default
+    async def settle(self):
+        task = self.task
+        if task.get("poll_probe_next", 0) > self.manager.clock():
+            return
+        # Recover external approvals even if their member update was missed.
+        member = await self.ops.call(
+            task,
+            "member_before_settle",
+            "get_chat_member",
+            dict(chat_id=task["group_id"], user_id=task["user_id"]),
+        )
+        if member and (
+            member["status"] in {"member", "administrator", "creator"}
+            or (member["status"] == "restricted" and member["is_member"])
+        ):
+            await self.store.finish_external(
+                task["uuid"], "approve", "member_present", self.manager.clock()
+            )
+            return
+        # A negative observation is not durable proof that the request is still
+        # pending. Refresh it on the next settlement attempt, including reboot.
+        operation = await self.store.operation(task["uuid"], "member_before_settle")
+        operation.update(state="pending", attempts=0, next_at=0)
+        await self.store.save_operation(task["uuid"], "member_before_settle", operation)
+        if task["mode"] == "poll" and not task.get("poll", {}).get("closed"):
+            if task.get("poll_probe_next", 0) > self.manager.clock():
+                return
+            ref = task["refs"].get("vote")
+            if not ref:
+                await self.ops.attention(task, "poll_reference_missing")
+            try:
+                result = await self.ops.call(
+                    task,
+                    "stop_poll",
+                    "stop_poll",
+                    dict(chat_id=ref["chat_id"], message_id=ref["message_id"]),
+                )
+            except PollUnavailable:
+                # Auto-closed polls may not generate a final Update. Telegram
+                # returns the actual Message (including Poll) when its keyboard
+                # changes. Never infer counts from "can't be stopped" itself.
+                probe = task.get("poll_probe", 0)
+                message = await self.ops.call(
+                    task,
+                    f"read_poll_controls_{probe}",
+                    "edit_message_reply_markup",
+                    dict(
+                        chat_id=ref["chat_id"],
+                        message_id=ref["message_id"],
+                        reply_markup=self.action_keyboard(),
+                    ),
+                )
+                # These controls only trigger a fresh Message response. Native
+                # polls have no query button; remove the temporary markup even
+                # when the response contains no usable final totals.
+                await self.clear_poll_markup()
+                result = message.get("poll") if isinstance(message, dict) else None
+                if not result or not result.get("closed"):
+                    # A retry after an interrupted edit can return "not modified".
+                    # The cleared keyboard allows a fresh edit next time.
+                    task["poll_probe"] = probe + 1
+                    attempts = task.get("poll_probe_attempts", 0) + 1
+                    task["poll_probe_attempts"] = attempts
+                    task["poll_probe_next"] = self.manager.clock() + min(
+                        60, 2 ** min(attempts, 6)
+                    )
+                    await self.save()
+                    if attempts < 10:
+                        return
+            if not result or not result.get("closed"):
+                await self.ops.attention(task, "final_poll_missing")
+            await self.store.poll(
+                task["poll_id"], result, 2**63 - 1, self.manager.clock()
+            )
+        if task["mode"] == "poll":
+            # Also finish clearing if a crash happened after the final Poll was
+            # persisted but before its temporary keyboard was removed.
+            await self.clear_poll_markup()
+        await self.store.decide(task["uuid"], None, self.manager.clock())
 
-    @property
-    def chat_id(self) -> int:
-        return self.request.chat.id
+    async def clear_poll_markup(self):
+        ref = self.task["refs"].get("vote")
+        probe = self.task.get("poll_probe", 0)
+        read_name = f"read_poll_controls_{probe}"
+        operation = await self.store.operation(self.task["uuid"], read_name)
+        if operation is None:
+            # Clear query buttons persisted by the earlier recovery implementation.
+            read_name = f"read_poll_{probe}"
+            operation = await self.store.operation(self.task["uuid"], read_name)
+        if ref and operation and operation["state"] == "success":
+            await self.ops.call(
+                self.task,
+                f"clear_{read_name}",
+                "edit_message_reply_markup",
+                dict(
+                    chat_id=ref["chat_id"],
+                    message_id=ref["message_id"],
+                    reply_markup=types.InlineKeyboardMarkup().to_json(),
+                ),
+                optional=True,
+            )
 
-    @property
-    def user_id(self) -> int:
-        return self.request.from_user.id
+    async def resolve(self):
+        task = self.task
+        d = task["decision"]
+        action = d["action"]
+        # banChatMember itself rejects/prevents membership. Do not first issue an
+        # ambiguous decline that could prevent completion of a confirmed ban.
+        method = {
+            "approve": "approve_chat_join_request",
+            "reject": "decline_chat_join_request",
+            "ban": "ban_chat_member",
+        }[action]
+        await self.ops.call(
+            task,
+            "apply_" + str(d.get("generation", 0)),
+            method,
+            dict(chat_id=task["group_id"], user_id=task["user_id"]),
+            policy="approval",
+        )
+        await self.store.finish_approval(task["uuid"], self.manager.clock())
 
-    def _user_display(self, user: types.User) -> str:
-        if user.username:
-            return f"@{user.username}"
-        full_name = html.escape(user.full_name)
-        return f'<a href="tg://user?id={user.id}">{full_name}</a>'
+    def result_keys(self):
+        d = self.task["decision"]
+        if d.get("reason") == "external":
+            outcome = "approved" if d["action"] == "approve" else "closed"
+            return (
+                f"jr_status_external_{outcome}",
+                f"jr_external_{outcome}_notice",
+                f"jr_external_{outcome}_notice",
+            )
+        if d.get("admin_id"):
+            status = {
+                "approve": "jr_status_admin_approved",
+                "reject": "jr_status_admin_rejected",
+                "ban": "jr_status_admin_banned",
+            }[d["action"]]
+            return (
+                status,
+                "jr_group_approved"
+                if d["action"] == "approve"
+                else "jr_group_rejected",
+                "jr_private_approved"
+                if d["action"] == "approve"
+                else "jr_private_rejected",
+            )
+        if d["reason"] == "insufficient":
+            return (
+                "jr_status_not_enough_voters",
+                "jr_not_enough_voters",
+                "jr_no_votes_private",
+            )
+        if d["reason"] == "tie":
+            return "jr_status_tie", "jr_group_tie", "jr_private_rejected"
+        return (
+            ("jr_status_approved", "jr_group_approved", "jr_private_approved")
+            if d["action"] == "approve"
+            else ("jr_status_rejected", "jr_group_rejected", "jr_private_rejected")
+        )
 
-    def _user_full_name_link(self, user_id: int, full_name: str) -> str:
-        return f'<a href="tg://user?id={user_id}">{html.escape(full_name)}</a>'
-
-    def _admin_display(self, user: types.User) -> str:
-        if user.username:
-            return f"@{user.username}"
-        return html.escape(user.full_name)
-
-    def _vote_minutes(self) -> int:
-        minutes = self.vote_time // 60
-        return max(minutes, 1)
-
-    def _reply_to_message_id(self) -> int | None:
-        if not self.message1:
-            return None
-        return self.message1.message_id
-
-    def _build_log_text(
-        self,
-        status: str,
-        yes_votes: int | None = None,
-        no_votes: int | None = None,
-        admin_id: int | None = None,
-        admin_name: str | None = None,
-    ) -> str:
-        applicant = self.request.from_user
+    def log_text(self, status):
+        task = self.task
         lines = [
-            f"<b>Chat:</b> {html.escape(self.request.chat.title or str(self.request.chat.id))}",
-            f"<b>User:</b> {self._user_full_name_link(applicant.id, applicant.full_name)}",
-            f"<b>User ID:</b> <code>{applicant.id}</code>",
+            f"<b>Chat:</b> {html.escape(task.get('chat_title') or str(task['group_id']))}",
+            f"<b>User:</b> {self.applicant()}",
+            f"<b>User ID:</b> <code>{task['user_id']}</code>",
             f"<b>Status:</b> {status}",
         ]
-        if yes_votes is not None and no_votes is not None:
-            lines.append(f"<b>Result:</b> Allow : Deny = {yes_votes} : {no_votes}")
-        if admin_id is not None and admin_name:
+        d = task.get("decision", {})
+        if d.get("yes") is not None:
+            lines.append(f"<b>Result:</b> Allow : Deny = {d['yes']} : {d['no']}")
+        if d.get("admin_id"):
             lines.append(
-                f"<b>Admin:</b> {self._user_full_name_link(admin_id, admin_name)}"
+                f"<b>Admin:</b> {html.escape(d.get('admin_name', str(d['admin_id'])))}"
             )
         return "\n".join(lines)
 
-    def _log_channel_config(self) -> tuple[bool, int | None, int | None]:
-        enabled = bool(settings.get("logchannel.enable", False))
-        channel_id = settings.get("logchannel.channel_id", None)
-        thread_id = settings.get("logchannel.message_thread_id", None)
-
-        channel_id_value = int(channel_id) if channel_id is not None else None
-        thread_id_value = int(thread_id) if thread_id is not None else None
-        return enabled, channel_id_value, thread_id_value
-
-    async def _send_pending_log(self):
-        enabled, channel_id, thread_id = self._log_channel_config()
-        if not enabled or channel_id is None:
-            return
-
-        kwargs = {
-            "chat_id": channel_id,
-            "text": self._build_log_text(status="Pending"),
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        if thread_id is not None and thread_id != 0:
-            kwargs["message_thread_id"] = thread_id
-
-        try:
-            message = await self.bot.send_message(**kwargs)
-            self.log_message_id = message.message_id
-        except Exception:
-            self.log_message_id = None
-
-    async def _edit_log_result(
-        self,
-        status: str,
-        yes_votes: int | None = None,
-        no_votes: int | None = None,
-        admin_id: int | None = None,
-        admin_name: str | None = None,
-    ):
-        enabled, channel_id, _ = self._log_channel_config()
-        if not enabled or channel_id is None or self.log_message_id is None:
-            return
-
-        try:
-            await self.bot.edit_message_text(
-                chat_id=channel_id,
-                message_id=self.log_message_id,
-                text=self._build_log_text(
-                    status=status,
-                    yes_votes=yes_votes,
-                    no_votes=no_votes,
-                    admin_id=admin_id,
-                    admin_name=admin_name,
-                ),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            return
-
-    async def _safe_delete_message(self, chat_id: int, message_id: int | None):
-        if not message_id:
-            return
-        try:
-            await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception:
-            return
-
-    async def _safe_unpin_message(self, message_id: int | None):
-        if not message_id:
-            return
-        try:
-            await self.bot.unpin_chat_message(
-                chat_id=self.chat_id,
-                message_id=message_id,
-            )
-        except Exception:
-            return
-
-    async def _safe_stop_poll(self):
-        if self.advanced_vote_enabled:
-            return None
-        if not self.message2:
-            return None
-        try:
-            return await self.bot.stop_poll(
-                chat_id=self.chat_id,
-                message_id=self.message2.message_id,
-            )
-        except Exception:
-            return None
-
-    async def _close_failed_request(self):
-        applicant = self.request.from_user
-        applicant_display = self._user_display(applicant)
-
-        if self.message1:
-            await self._run_best_effort(
-                "refresh_message1",
-                self._refresh_message1(
-                    "jr_status_rejected",
-                    user=applicant_display,
-                    user_id=applicant.id,
-                ),
-            )
-
-        await self._safe_update_join_request(
-            uuid=self.uuid,
-            result=False,
-            yes_votes=0,
-            no_votes=0,
-        )
-
-        await self._run_best_effort(
-            "apply_join_result",
-            self._apply_join_result(False),
-        )
-
-    async def _apply_join_result(self, approved: bool):
-        if approved:
-            await self.bot.approve_chat_join_request(
-                chat_id=self.chat_id,
-                user_id=self.user_id,
-            )
-        else:
-            await self.bot.decline_chat_join_request(
-                chat_id=self.chat_id,
-                user_id=self.user_id,
-            )
-
-    async def _check_invite_permission(self, user_id: int) -> bool:
-        try:
-            member = await self.bot.get_chat_member(
-                chat_id=self.chat_id, user_id=user_id
-            )
-            if member.status == "creator":
-                return True
-            if member.status != "administrator":
-                return False
-            return bool(getattr(member, "can_invite_users", False))
-        except Exception:
-            self._log_step_failure("check_invite_permission")
-            return False
-
-    async def _is_group_member(self, user_id: int) -> bool:
-        try:
-            member = await self.bot.get_chat_member(
-                chat_id=self.chat_id, user_id=user_id
-            )
-            return member.status not in {"left", "kicked"}
-        except Exception:
-            self._log_step_failure("is_group_member")
-            return False
-
-    async def _get_bot_username(self) -> str:
-        if BotSetting.bot_username:
-            return BotSetting.bot_username
-        try:
-            me = await self.bot.get_me()
-            return me.username or ""
-        except Exception:
-            self._log_step_failure("get_bot_username")
-            return ""
-
-    def _has_voted(self, user_id: int) -> bool:
-        return user_id in self._yes_voters or user_id in self._no_voters
-
-    async def _build_advanced_vote_keyboard(self) -> types.InlineKeyboardMarkup:
-        bot_username = await self._get_bot_username()
-        keyboard = types.InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            types.InlineKeyboardButton(
-                text=t(self.language, "jr_poll_yes"),
-                callback_data=f"jrv {self.uuid} yes",
+    async def cleanup(self):
+        task = self.task
+        status, group_key, private_key = self.result_keys()
+        d = task["decision"]
+        await self.edit(
+            "result_intro",
+            "intro",
+            self.text(
+                status,
+                user=self.applicant(),
+                user_id=task["user_id"],
+                admin=html.escape(d.get("admin_name", "")),
             ),
-            types.InlineKeyboardButton(
-                text=t(self.language, "jr_poll_no"),
-                callback_data=f"jrv {self.uuid} no",
-            ),
-        )
-        if bot_username:
-            keyboard.add(
-                types.InlineKeyboardButton(
-                    text=t(self.language, "jr_live_result"),
-                    url=f"https://t.me/{bot_username}?start=jrres_{self.uuid}",
-                )
-            )
-        return keyboard
-
-    async def _refresh_message1(self, key: str, **kwargs):
-        if not self.message1:
-            return
-        await self.bot.edit_message_text(
-            chat_id=self.chat_id,
-            message_id=self.message1.message_id,
-            text=t(self.language, key, **kwargs),
             parse_mode="HTML",
-            reply_markup=None,
+            reply_markup=types.InlineKeyboardMarkup().to_json(),
         )
-
-    async def _safe_update_join_request(self, **kwargs) -> bool:
-        result = await self._run_best_effort(
-            "update_join_request",
-            BotDatabase.update_join_request(**kwargs),
-            default=False,
-        )
-        return bool(result)
-
-    async def _safe_get_join_request_waiting(self) -> bool | None:
-        return await self._run_best_effort(
-            "get_join_request_waiting",
-            BotDatabase.get_join_request_waiting_by_uuid(self.uuid),
-            default=None,
-        )
-
-    async def _safe_get_join_request_status(self) -> dict | None:
-        return await self._run_best_effort(
-            "get_join_request_status",
-            BotDatabase.get_join_request_status_by_uuid(self.uuid),
-            default=None,
-        )
-
-    async def _safe_send_group_message(self, text: str):
-        kwargs = {
-            "chat_id": self.chat_id,
-            "text": text,
-        }
-        reply_to_message_id = self._reply_to_message_id()
-        if reply_to_message_id is not None:
-            kwargs["reply_to_message_id"] = reply_to_message_id
-        return await self._run_best_effort(
-            "send_group_message",
-            self.bot.send_message(**kwargs),
-        )
-
-    async def _safe_answer_callback_query(
-        self, callback_query_id: int | str, text: str, **kwargs
-    ):
-        return await self._run_best_effort(
-            "answer_callback_query",
-            self.bot.answer_callback_query(
-                callback_query_id=callback_query_id,
-                text=text,
-                **kwargs,
-            ),
-        )
-
-    async def _finalize_vote_result(
-        self,
-        applicant: types.User,
-        applicant_display: str,
-        *,
-        group_text_key: str,
-        status_key: str,
-        private_key: str,
-        approved: bool,
-        yes_votes: int,
-        no_votes: int,
-        unpin_message2: bool,
-    ):
-        self.message4 = await self._safe_send_group_message(
-            t(self.language, group_text_key)
-        )
-        await self._run_best_effort(
-            "refresh_message1",
-            self._refresh_message1(
-                status_key,
-                user=applicant_display,
-                user_id=applicant.id,
-            ),
-        )
-        await self._run_best_effort(
-            "notify_applicant",
-            self._notify_applicant(private_key),
-        )
-        if unpin_message2 and self.message2:
-            await self._safe_unpin_message(self.message2.message_id)
-        await self._safe_update_join_request(
-            uuid=self.uuid,
-            result=approved,
-            yes_votes=yes_votes,
-            no_votes=no_votes,
-        )
-        await self._run_best_effort(
-            "apply_join_result",
-            self._apply_join_result(approved),
-        )
-        await self._edit_log_result(
-            status="Approved" if approved else "Denied",
-            yes_votes=yes_votes,
-            no_votes=no_votes,
-        )
-
-    async def _finalize_admin_action(
-        self,
-        call: types.CallbackQuery,
-        *,
-        result: bool,
-        status_key: str,
-        private_key: str,
-        ban_user: bool = False,
-    ):
-        admin_display = self._admin_display(call.from_user)
-        applicant = self.request.from_user
-        applicant_display = self._user_display(applicant)
-
-        await self._safe_update_join_request(
-            uuid=self.uuid,
-            result=result,
-            admin=call.from_user.id,
-        )
-        await self._run_best_effort(
-            "refresh_message1",
-            self._refresh_message1(
-                status_key,
-                user=applicant_display,
-                user_id=applicant.id,
-                admin=admin_display,
-            ),
-        )
-        await self._run_best_effort(
-            "notify_applicant",
-            self._notify_applicant(private_key),
-        )
-        await self._run_best_effort(
-            "apply_join_result",
-            self._apply_join_result(result),
-        )
-        if ban_user:
-            await self._run_best_effort(
-                "ban_chat_member",
-                self.bot.ban_chat_member(chat_id=self.chat_id, user_id=self.user_id),
+        ref = task["refs"].get("vote")
+        if ref:
+            if task["mode"] == "poll":
+                await self.clear_poll_markup()
+                # Admin decisions do not need poll totals; closing is cleanup only.
+                await self.ops.call(
+                    task,
+                    "close_after_decision",
+                    "stop_poll",
+                    dict(chat_id=ref["chat_id"], message_id=ref["message_id"]),
+                    optional=True,
+                )
+            else:
+                await self.edit(
+                    "close_buttons",
+                    "vote",
+                    self.text(group_key)
+                    if d.get("reason") == "external"
+                    else self.text(
+                        "jr_final_votes",
+                        yes_votes=d.get("yes", 0),
+                        no_votes=d.get("no", 0),
+                    ),
+                    reply_markup=types.InlineKeyboardMarkup().to_json(),
+                )
+            if task.get("settings", {}).get("pin_msg"):
+                await self.ops.call(
+                    task,
+                    "unpin",
+                    "unpin_chat_message",
+                    dict(chat_id=ref["chat_id"], message_id=ref["message_id"]),
+                    optional=True,
+                )
+        await self.send("result", task["group_id"], self.text(group_key))
+        applicant = task["refs"].get("applicant")
+        if applicant:
+            await self.send(
+                "private_result", applicant["chat_id"], self.text(private_key)
             )
-        await self._edit_log_result(
-            status="Approved" if result else "Denied",
-            admin_id=call.from_user.id,
-            admin_name=call.from_user.full_name,
-        )
-
-    async def _notify_applicant(self, text_key: str):
-        if not self.message3:
-            return
-        try:
-            await self.bot.send_message(
-                chat_id=self.user_id,
-                text=t(self.language, text_key),
-                reply_to_message_id=self.message3.message_id,
-            )
-        except Exception:
-            return
-
-    def _status_label(self, waiting: bool, result: bool | None) -> str:
-        if waiting:
-            return t(self.language, "jr_status_pending_label")
-        if result is True:
-            return t(self.language, "jr_status_approve_label")
-        return t(self.language, "jr_status_reject_label")
-
-    async def run(self):
-        applicant = self.request.from_user
-        applicant_display = self._user_display(applicant)
-        logger.debug(
-            "join request flow start uuid={} chat_id={} user_id={} advanced_vote={} anonymous_vote={}",
-            self.uuid,
-            self.chat_id,
-            self.user_id,
-            self.advanced_vote_enabled,
-            bool(self.group_settings.get("anonymous_vote", True)),
-        )
-
-        msg1_text = t(
-            self.language,
-            "jr_requesting",
-            user=applicant_display,
-            user_id=applicant.id,
-        )
-        keyboard = types.InlineKeyboardMarkup(row_width=3)
-        keyboard.add(
-            types.InlineKeyboardButton(
-                "Approve", callback_data=f"jr {self.uuid} approve"
+        await self.edit(
+            "log_result",
+            "log",
+            self.log_text(
+                (
+                    "Approved externally"
+                    if d["action"] == "approve"
+                    else "Closed externally; outcome unknown"
+                )
+                if d.get("reason") == "external"
+                else ("Approved" if d["action"] == "approve" else "Denied")
             ),
-            types.InlineKeyboardButton(
-                "Reject", callback_data=f"jr {self.uuid} reject"
-            ),
-            types.InlineKeyboardButton("Ban", callback_data=f"jr {self.uuid} ban"),
+            parse_mode="HTML",
         )
+        if self.manager.clock() < task["cleanup_at"]:
+            return
+        for name in ("vote", "result"):
+            ref = task["refs"].get(name)
+            if ref:
+                await self.ops.call(
+                    task,
+                    "delete_" + name,
+                    "delete_message",
+                    dict(chat_id=ref["chat_id"], message_id=ref["message_id"]),
+                    optional=True,
+                )
+        task["phase"] = "done"
+        await self.save()
 
-        self.message1 = await self._run_best_effort(
-            "send_message1",
-            self.bot.send_message(
-                chat_id=self.chat_id,
-                text=msg1_text,
+    async def tick(self):
+        task = self.task
+        if task["phase"] == "preparing":
+            await self.prepare()
+        elif task["phase"] == "voting":
+            if self.manager.clock() >= task["deadline"]:
+                await self.settle()
+            else:
+                await self.voting_setup()
+        elif task["phase"] == "resolving":
+            await self.resolve()
+        elif task["phase"] == "cleanup":
+            await self.cleanup()
+        elif task["phase"] == "needs_attention":
+            if task.get("mode") == "poll":
+                await self.clear_poll_markup()
+            await self.edit(
+                "attention_" + str(task.get("attention_generation", 0)),
+                "intro",
+                self.text(
+                    "recover_task",
+                    uuid=task["uuid"],
+                    user_id=task["user_id"],
+                    reason=self.recovery_reason(),
+                ),
                 parse_mode="HTML",
-                reply_markup=keyboard,
-            ),
-        )
-        if self.message1:
-            logger.debug(
-                "message1 sent uuid={} chat_id={} message_id={}",
-                self.uuid,
-                self.chat_id,
-                self.message1.message_id,
-            )
-        await self._send_pending_log()
-
-        if self.advanced_vote_enabled:
-            try:
-                self.message2 = await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=t(self.language, "jr_poll_question"),
-                    reply_markup=await self._build_advanced_vote_keyboard(),
-                    protect_content=True,
-                    **(
-                        {"reply_to_message_id": self.message1.message_id}
-                        if self.message1
-                        else {}
-                    ),
-                )
-                logger.debug(
-                    "advanced message2 sent uuid={} chat_id={} message_id={}",
-                    self.uuid,
-                    self.chat_id,
-                    self.message2.message_id,
-                )
-            except Exception:
-                logger.exception(
-                    "failed to send advanced message2 uuid={} chat_id={}",
-                    self.uuid,
-                    self.chat_id,
-                )
-                await self._close_failed_request()
-                return
-        else:
-            try:
-                self.message2 = await self.bot.send_poll(
-                    chat_id=self.chat_id,
-                    question=t(self.language, "jr_poll_question"),
-                    options=[
-                        t(self.language, "jr_poll_yes"),
-                        t(self.language, "jr_poll_no"),
-                    ],
-                    is_anonymous=bool(self.group_settings.get("anonymous_vote", True)),
-                    protect_content=True,
-                    allows_multiple_answers=False,
-                    **(
-                        {"reply_to_message_id": self.message1.message_id}
-                        if self.message1
-                        else {}
-                    ),
-                )
-                logger.debug(
-                    "poll message2 sent uuid={} chat_id={} message_id={}",
-                    self.uuid,
-                    self.chat_id,
-                    self.message2.message_id,
-                )
-            except Exception:
-                logger.exception(
-                    "failed to send poll message2, fallback to advanced uuid={} chat_id={}",
-                    self.uuid,
-                    self.chat_id,
-                )
-                self.advanced_vote_enabled = True
-                try:
-                    self.message2 = await self.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=t(self.language, "jr_poll_question"),
-                        reply_markup=await self._build_advanced_vote_keyboard(),
-                        protect_content=True,
-                        **(
-                            {"reply_to_message_id": self.message1.message_id}
-                            if self.message1
-                            else {}
-                        ),
-                    )
-                    logger.warning(
-                        "poll fallback activated, advanced message2 sent uuid={} chat_id={} message_id={}",
-                        self.uuid,
-                        self.chat_id,
-                        self.message2.message_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "failed to send fallback advanced message2 uuid={} chat_id={}",
-                        self.uuid,
-                        self.chat_id,
-                    )
-                    await self._close_failed_request()
-                    return
-
-        if self.group_settings.get("pin_msg", False):
-            try:
-                await self.bot.pin_chat_message(
-                    chat_id=self.chat_id,
-                    message_id=self.message2.message_id,
-                    disable_notification=True,
-                )
-                logger.debug(
-                    "message2 pinned uuid={} chat_id={} message_id={}",
-                    self.uuid,
-                    self.chat_id,
-                    self.message2.message_id,
-                )
-            except Exception:
-                logger.exception(
-                    "failed to pin message2 uuid={} chat_id={} message_id={}",
-                    self.uuid,
-                    self.chat_id,
-                    self.message2.message_id if self.message2 else None,
-                )
-                pass
-
-        try:
-            status_keyboard = types.InlineKeyboardMarkup(row_width=1)
-            status_keyboard.add(
-                types.InlineKeyboardButton(
-                    text=t(self.language, "jr_check_status"),
-                    callback_data=f"jrs {self.uuid}",
-                )
-            )
-            self.message3 = await self.bot.send_message(
-                chat_id=self.user_id,
-                text=t(
-                    self.language,
-                    "jr_apply_notice",
-                    group_name=self.request.chat.title,
-                    vote_minutes=self._vote_minutes(),
-                ),
-                reply_markup=status_keyboard,
-            )
-            logger.debug(
-                "message3 sent to applicant uuid={} user_id={} message_id={}",
-                self.uuid,
-                self.user_id,
-                self.message3.message_id,
-            )
-        except Exception:
-            logger.exception(
-                "failed to send message3 to applicant uuid={} user_id={}",
-                self.uuid,
-                self.user_id,
-            )
-            self.message3 = None
-
-        try:
-            await asyncio.wait_for(self._manual_resolved.wait(), timeout=self.vote_time)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        waiting = await self._safe_get_join_request_waiting()
-        if waiting is not True:
-            logger.debug(
-                "join request already resolved before timeout uuid={}", self.uuid
-            )
-            return
-
-        yes_votes = 0
-        no_votes = 0
-        if self.advanced_vote_enabled:
-            async with self._vote_lock:
-                yes_votes = len(self._yes_voters)
-                no_votes = len(self._no_voters)
-            if self.message2:
-                try:
-                    await self.bot.edit_message_text(
-                        chat_id=self.chat_id,
-                        message_id=self.message2.message_id,
-                        text=t(
-                            self.language,
-                            "jr_final_votes",
-                            yes_votes=yes_votes,
-                            no_votes=no_votes,
-                        ),
-                    )
-                except Exception:
-                    pass
-        else:
-            poll_result = await self._safe_stop_poll()
-
-            if poll_result and poll_result.options and len(poll_result.options) >= 2:
-                yes_votes = int(poll_result.options[0].voter_count)
-                no_votes = int(poll_result.options[1].voter_count)
-            elif (
-                self.message2
-                and self.message2.poll
-                and len(self.message2.poll.options) >= 2
-            ):
-                yes_votes = int(self.message2.poll.options[0].voter_count)
-                no_votes = int(self.message2.poll.options[1].voter_count)
-
-        total_votes = yes_votes + no_votes
-        min_voters = int(self.group_settings.get("mini_voters", 1))
-        logger.debug(
-            "vote result collected uuid={} yes_votes={} no_votes={} total={} min_voters={}",
-            self.uuid,
-            yes_votes,
-            no_votes,
-            total_votes,
-            min_voters,
-        )
-
-        if total_votes < min_voters:
-            self.message4 = await self._safe_send_group_message(
-                t(self.language, "jr_not_enough_voters")
-            )
-            await self._run_best_effort(
-                "refresh_message1",
-                self._refresh_message1(
-                    "jr_status_not_enough_voters",
-                    user=applicant_display,
-                    user_id=applicant.id,
-                ),
-            )
-            await self._run_best_effort(
-                "notify_applicant",
-                self._notify_applicant("jr_no_votes_private"),
-            )
-            await self._safe_update_join_request(
-                uuid=self.uuid,
-                result=False,
-                yes_votes=yes_votes,
-                no_votes=no_votes,
-            )
-            await self._run_best_effort(
-                "apply_join_result",
-                self._apply_join_result(False),
-            )
-            await self._edit_log_result(
-                status="Denied",
-                yes_votes=yes_votes,
-                no_votes=no_votes,
-            )
-        else:
-            if yes_votes > no_votes:
-                status_key = "jr_status_approved"
-                group_key = "jr_group_approved"
-                private_key = "jr_private_approved"
-                approved = True
-            elif yes_votes == no_votes:
-                status_key = "jr_status_tie"
-                group_key = "jr_group_tie"
-                private_key = "jr_private_rejected"
-                approved = False
-            else:
-                status_key = "jr_status_rejected"
-                group_key = "jr_group_rejected"
-                private_key = "jr_private_rejected"
-                approved = False
-
-            await self._finalize_vote_result(
-                applicant,
-                applicant_display,
-                group_text_key=group_key,
-                status_key=status_key,
-                private_key=private_key,
-                approved=approved,
-                yes_votes=yes_votes,
-                no_votes=no_votes,
-                unpin_message2=bool(self.group_settings.get("pin_msg", False)),
+                reply_markup=self.action_keyboard(recovery=True),
             )
 
-        await asyncio.sleep(60)
-        if self.message2:
-            await self._safe_delete_message(self.chat_id, self.message2.message_id)
-        if self.message4:
-            await self._safe_delete_message(self.chat_id, self.message4.message_id)
-        logger.debug("join request flow completed uuid={}", self.uuid)
-
-    async def handle_action(self, call: types.CallbackQuery, action: str):
-        if not await self._check_invite_permission(call.from_user.id):
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text=t(self.language, "insufficient_permissions"),
-                show_alert=True,
-            )
-            return
-
-        waiting = await self._safe_get_join_request_waiting()
-        if not waiting:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text="Expired",
-                show_alert=False,
-            )
-            return
-
-        if action == "approve":
-            await self._finalize_admin_action(
-                call,
-                result=True,
-                status_key="jr_status_admin_approved",
-                private_key="jr_private_approved",
-            )
-        elif action == "reject":
-            await self._finalize_admin_action(
-                call,
-                result=False,
-                status_key="jr_status_admin_rejected",
-                private_key="jr_private_rejected",
-            )
-        elif action == "ban":
-            await self._finalize_admin_action(
-                call,
-                result=False,
-                status_key="jr_status_admin_banned",
-                private_key="jr_private_rejected",
-                ban_user=True,
-            )
-        else:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text="Unsupported action",
-            )
-            return
-
-        self._manual_resolved.set()
-        await self._safe_stop_poll()
-        if self.group_settings.get("pin_msg", False) and self.message2:
-            await self._safe_unpin_message(self.message2.message_id)
-        if self.message2:
-            await self._safe_delete_message(self.chat_id, self.message2.message_id)
-
-        await self._safe_answer_callback_query(callback_query_id=call.id, text="Done")
-
-    async def handle_vote(self, call: types.CallbackQuery, option: str):
-        if not self.advanced_vote_enabled:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text="Expired",
-            )
-            return
-
-        waiting = await self._safe_get_join_request_waiting()
-        if waiting is not True:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text="Expired",
-            )
-            return
-
+    async def handle_vote(self, call, option, received_at):
         if option not in {"yes", "no"}:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text="Invalid vote",
+            return await self.manager.answer(call, self.text("recover_expired"))
+        member = await self.bot.get_chat_member(
+            self.task["group_id"], call.from_user.id
+        )
+        if not member_present(member):
+            return await self.manager.answer(
+                call, self.text("insufficient_permissions")
             )
-            return
+        result = await self.store.vote(
+            self.task["uuid"],
+            call.from_user.id,
+            call.from_user.full_name,
+            option,
+            received_at,
+        )
+        key = {
+            "expired": "recover_expired",
+            "recorded": "jr_vote_recorded",
+            "duplicate": "jr_already_voted",
+        }[result]
+        await self.manager.answer(call, self.text(key))
 
-        if not await self._is_group_member(call.from_user.id):
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text=t(self.language, "insufficient_permissions"),
-                show_alert=True,
+    async def handle_action(self, call, action):
+        task = self.task
+        if (
+            not call.message
+            or call.message.chat.id != task["group_id"]
+            or not await self.manager.is_admin(task["group_id"], call.from_user.id)
+        ):
+            return await self.manager.answer(
+                call, self.text("insufficient_permissions")
             )
-            return
-
-        async with self._vote_lock:
-            if self._has_voted(call.from_user.id):
-                await self._safe_answer_callback_query(
-                    callback_query_id=call.id,
-                    text=t(self.language, "jr_already_voted"),
-                    show_alert=True,
+        if action == "retry":
+            if not await self.manager.retry(task):
+                return await self.manager.answer(
+                    call, self.text("recover_reason_snapshot"), show_alert=True
                 )
-                return
+        elif action in {"approve", "reject", "ban"}:
+            decision = dict(
+                action=action,
+                admin_id=call.from_user.id,
+                admin_name=call.from_user.full_name,
+                reason="admin",
+                generation=self.manager.update_id,
+            )
+            if not await self.store.decide(
+                task["uuid"], decision, self.manager.clock(), manual=True
+            ):
+                return await self.manager.answer(call, self.text("recover_expired"))
+        else:
+            return await self.manager.answer(call, self.text("recover_expired"))
+        await self.manager.answer(call, self.text("jr_status_processing_label"))
 
-            full_name = call.from_user.full_name
-            if option == "yes":
-                self._yes_voters[call.from_user.id] = full_name
-            else:
-                self._no_voters[call.from_user.id] = full_name
-
-        await self._safe_answer_callback_query(
-            callback_query_id=call.id,
-            text=t(self.language, "jr_vote_recorded"),
+    async def handle_status_query(self, call):
+        if call.from_user.id != self.task["user_id"]:
+            return await self.manager.answer(
+                call, self.text("insufficient_permissions")
+            )
+        phase = self.task["phase"]
+        if self.task.get("applied"):
+            label = (
+                "jr_status_approve_label"
+                if self.task["decision"]["action"] == "approve"
+                else (
+                    "jr_status_closed_label"
+                    if self.task["decision"]["action"] == "closed"
+                    else "jr_status_reject_label"
+                )
+            )
+        elif phase == "needs_attention":
+            label = "jr_status_attention_label"
+        elif phase == "resolving":
+            label = "jr_status_processing_label"
+        else:
+            label = "jr_status_pending_label"
+        await self.manager.answer(
+            call, self.text("jr_status_query", status=self.text(label)), show_alert=True
         )
 
-    async def handle_realtime_result_request(self, message: types.Message):
-        waiting = await self._safe_get_join_request_waiting()
-        if waiting is not True:
-            await self._run_best_effort(
-                "reply_expired", self.bot.reply_to(message, "Expired")
+    async def handle_realtime_result_request(self, message):
+        if self.task["phase"] != "voting" or self.task["mode"] != "advanced":
+            return await self.bot.reply_to(message, self.text("recover_expired"))
+        if not await self.manager.is_member(
+            self.task["group_id"], message.from_user.id
+        ):
+            return await self.bot.reply_to(
+                message, self.text("insufficient_permissions")
             )
-            return
-
-        user_id = message.from_user.id if message.from_user else None
-        if user_id is None:
-            return
-
-        if not await self._is_group_member(user_id):
-            await self._run_best_effort(
-                "reply_insufficient_permissions",
-                self.bot.reply_to(
-                    message, t(self.language, "insufficient_permissions")
-                ),
-            )
-            return
-
-        async with self._vote_lock:
-            if not self._has_voted(user_id):
-                await self._run_best_effort(
-                    "reply_not_voted",
-                    self.bot.reply_to(message, t(self.language, "jr_not_voted")),
-                )
-                return
-
-            yes_votes = len(self._yes_voters)
-            no_votes = len(self._no_voters)
-
-            if self.group_settings.get("anonymous_vote", True):
-                text = t(
-                    self.language,
-                    "jr_live_votes_anonymous",
-                    yes_votes=yes_votes,
-                    no_votes=no_votes,
-                )
-            else:
-                yes_names = "\n".join(self._yes_voters.values()) or "-"
-                no_names = "\n".join(self._no_voters.values()) or "-"
-                text = t(
-                    self.language,
-                    "jr_live_votes_public",
-                    yes_votes=yes_votes,
-                    no_votes=no_votes,
-                    yes_names=yes_names,
-                    no_names=no_names,
-                )
-
-        await self._run_best_effort(
-            "reply_realtime_result", self.bot.reply_to(message, text)
+        votes = await self.store.votes(self.task["uuid"])
+        if not any(row["user_id"] == message.from_user.id for row in votes):
+            return await self.bot.reply_to(message, self.text("jr_not_voted"))
+        yes = [row["name"] for row in votes if row["option"] == "yes"]
+        no = [row["name"] for row in votes if row["option"] == "no"]
+        text = self.text(
+            "jr_live_votes_anonymous"
+            if self.task["settings"].get("anonymous_vote", True)
+            else "jr_live_votes_public",
+            yes_votes=len(yes),
+            no_votes=len(no),
+            yes_names="\n".join(yes) or "-",
+            no_names="\n".join(no) or "-",
         )
-
-    async def handle_status_query(self, call: types.CallbackQuery):
-        if call.from_user.id != self.user_id:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text=t(self.language, "insufficient_permissions"),
-                show_alert=True,
-            )
-            return
-
-        status = await self._safe_get_join_request_status()
-        if status is None:
-            await self._safe_answer_callback_query(
-                callback_query_id=call.id,
-                text="Expired",
-            )
-            return
-
-        label = self._status_label(
-            waiting=bool(status.get("waiting", False)),
-            result=status.get("result"),
-        )
-        await self._safe_answer_callback_query(
-            callback_query_id=call.id,
-            text=t(self.language, "jr_status_query", status=label),
-            show_alert=True,
-        )
+        await self.bot.reply_to(message, text)

@@ -7,6 +7,7 @@ import aiosqlite
 from loguru import logger
 
 from utils.database_defaults import DEFAULT_GROUP_SETTINGS
+from utils.recovery_store import RecoveryStore, ReentrantLock, serialized
 
 
 class AsyncSQLiteDB:
@@ -17,6 +18,8 @@ class AsyncSQLiteDB:
             raise ValueError("database.path must be a non-empty SQLite file path")
         self.path = str(Path(path).expanduser())
         self.conn = None
+        self.transaction_lock = ReentrantLock()
+        self.recovery = RecoveryStore(self)
 
     async def connect(self):
         if self.conn is not None:
@@ -30,18 +33,23 @@ class AsyncSQLiteDB:
             self.conn.row_factory = aiosqlite.Row
             async with self.conn.execute("PRAGMA journal_mode=WAL"):
                 pass
+            async with self.conn.execute("PRAGMA synchronous=FULL"):
+                pass
             await self.ensure_tables_exist()
+            await self.recovery.initialize()
         except BaseException:
             await self.close()
             raise
         logger.success(f"Successfully connected to SQLite database at {self.path}")
 
+    @serialized
     async def close(self):
         if self.conn is not None:
             await self.conn.close()
             self.conn = None
             logger.info("SQLite database connection closed successfully")
 
+    @serialized
     async def ensure_tables_exist(self):
         async with self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS setting (
@@ -69,6 +77,7 @@ class AsyncSQLiteDB:
         """):
             pass
 
+    @serialized
     async def get_group_settings(self, group_id: int) -> dict:
         async with self.conn.execute(
             "SELECT * FROM setting WHERE group_id = ?", (group_id,)
@@ -97,6 +106,7 @@ class AsyncSQLiteDB:
                 result[field] = bool(result[field])
         return result
 
+    @serialized
     async def update_group_setting(self, group_id: int, item: str, value) -> bool:
         if item not in self.DEFAULT_GROUP_SETTINGS:
             raise ValueError(f"Unsupported setting field: {item}")
@@ -106,6 +116,7 @@ class AsyncSQLiteDB:
         ) as cursor:
             return cursor.rowcount == 1
 
+    @serialized
     async def create_join_request(self, uuid: str, group_id: int, user_id: int) -> None:
         async with self.conn.execute(
             """
@@ -117,6 +128,7 @@ class AsyncSQLiteDB:
         ):
             pass
 
+    @serialized
     async def update_join_request(
         self,
         uuid: str,
@@ -137,6 +149,7 @@ class AsyncSQLiteDB:
         ) as cursor:
             return cursor.rowcount == 1
 
+    @serialized
     async def has_waiting_join_request(self, group_id: int, user_id: int) -> bool:
         async with self.conn.execute(
             """
@@ -150,10 +163,12 @@ class AsyncSQLiteDB:
             row = await cursor.fetchone()
             return bool(row[0])
 
+    @serialized
     async def get_join_request_waiting_by_uuid(self, uuid: str) -> bool | None:
         status = await self.get_join_request_status_by_uuid(uuid)
         return None if status is None else status["waiting"]
 
+    @serialized
     async def get_join_request_status_by_uuid(self, uuid: str) -> dict | None:
         async with self.conn.execute(
             """
