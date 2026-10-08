@@ -354,6 +354,12 @@ class JoinRequestVote:
 
     def result_keys(self):
         d = self.task["decision"]
+        if d.get("evidence") == "user_deactivated":
+            return (
+                "jr_status_user_deactivated",
+                "jr_user_deactivated_notice",
+                "jr_user_deactivated_notice",
+            )
         if d.get("reason") == "external":
             outcome = "approved" if d["action"] == "approve" else "closed"
             return (
@@ -458,7 +464,7 @@ class JoinRequestVote:
                 )
         await self.send("result", task["group_id"], self.text(group_key))
         applicant = task["refs"].get("applicant")
-        if applicant:
+        if applicant and d.get("evidence") != "user_deactivated":
             await self.send(
                 "private_result", applicant["chat_id"], self.text(private_key)
             )
@@ -466,7 +472,9 @@ class JoinRequestVote:
             "log_result",
             "log",
             self.log_text(
-                (
+                "Closed: applicant account deactivated"
+                if d.get("evidence") == "user_deactivated"
+                else (
                     "Approved externally"
                     if d["action"] == "approve"
                     else "Closed externally; outcome unknown"
@@ -505,6 +513,7 @@ class JoinRequestVote:
         elif task["phase"] == "cleanup":
             await self.cleanup()
         elif task["phase"] == "needs_attention":
+            await self.ops.recover_deactivated(task)
             if task.get("mode") == "poll":
                 await self.clear_poll_markup()
             await self.edit(
@@ -583,7 +592,9 @@ class JoinRequestVote:
         phase = self.task["phase"]
         if self.task.get("applied"):
             label = (
-                "jr_status_approve_label"
+                "jr_status_deactivated_label"
+                if self.task["decision"].get("evidence") == "user_deactivated"
+                else "jr_status_approve_label"
                 if self.task["decision"]["action"] == "approve"
                 else (
                     "jr_status_closed_label"

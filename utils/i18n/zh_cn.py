@@ -1,4 +1,7 @@
 MESSAGES = {
+    "jr_status_deactivated_label": "用户已注销，申请已结束",
+    "jr_status_user_deactivated": "{user} (ID: {user_id})：用户已注销，申请已结束。",
+    "jr_user_deactivated_notice": "申请人已注销 Telegram 账号，投票及申请已结束。",
     "setting_vote_duration_days": "{days} 天",
     "setting_vote_duration_hours": "{hours} 小时",
     "jr_status_closed_label": "已结束（外部处理或撤回）",

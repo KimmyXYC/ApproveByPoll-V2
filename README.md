@@ -259,6 +259,12 @@ do not reuse it for another bot token's identity.
   successful bot rejection merely because the user is absent. A later, distinct
   join request replaces the stale request atomically. External closure retains
   history, cancels voting and runs the usual recoverable cleanup.
+- An explicit deactivated-applicant error during approval, rejection, banning or
+  applicant membership checks closes the request with `waiting = false` and
+  `result = NULL`, then cleans up the vote. It is displayed as an account
+  deactivation, not a successful rejection or a permissions failure. Persisted
+  deactivation errors from earlier versions are also handled automatically after
+  upgrading and restarting; other permission errors still require review.
 - Telegram updates are committed locally before the receiving cursor advances.
   Received updates are replayed in order. Telegram keeps undelivered updates for
   at most 24 hours, so a longer outage can require manual recovery.

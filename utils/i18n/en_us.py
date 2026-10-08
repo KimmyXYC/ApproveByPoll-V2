@@ -1,4 +1,7 @@
 MESSAGES = {
+    "jr_status_deactivated_label": "Account deactivated; request closed",
+    "jr_status_user_deactivated": "{user} (ID: {user_id}): account deactivated; request closed.",
+    "jr_user_deactivated_notice": "The applicant’s Telegram account is deactivated. Voting and the request have ended.",
     "setting_vote_duration_days": "{days} d",
     "setting_vote_duration_hours": "{hours} h",
     "jr_status_closed_label": "Closed (handled externally or withdrawn)",

@@ -409,6 +409,183 @@ class RecoveryContract:
             (await self.db.get_join_request_status_by_uuid(task["uuid"]))["result"]
         )
 
+    async def test_deactivated_applicant_closes_each_approval_action(self):
+        for index, (action, method, code, description) in enumerate(
+            (
+                (
+                    "approve",
+                    "approve_chat_join_request",
+                    403,
+                    "Forbidden: user is deactivated",
+                ),
+                (
+                    "reject",
+                    "decline_chat_join_request",
+                    400,
+                    "Bad Request: INPUT_USER_DEACTIVATED",
+                ),
+                ("ban", "ban_chat_member", 400, "USER_DEACTIVATED"),
+            ),
+            start=1,
+        ):
+            with self.subTest(action=action):
+                self.manager.update_id = index
+                self.manager.received_at = self.clock()
+                await self.manager.create(request())
+                task = next(
+                    task
+                    for task in await self.store.tasks()
+                    if task["phase"] == "preparing"
+                )
+                await self.manager.tick()
+                await self.manager.tick()
+                await self.store.decide(
+                    task["uuid"],
+                    dict(action=action, admin_id=9),
+                    self.clock(),
+                    manual=True,
+                )
+                self.bot.failures[method] = [APIError(code, description)]
+                calls = self.bot.count(method)
+                await self.manager.tick()
+                state = await self.store.get(task["uuid"])
+                self.assertEqual(state["phase"], "cleanup")
+                self.assertEqual(state["decision"]["evidence"], "user_deactivated")
+                record = await self.db.get_join_request_status_by_uuid(task["uuid"])
+                self.assertFalse(record["waiting"])
+                self.assertIsNone(record["result"])
+                op = await self.store.operation(task["uuid"], "apply_0")
+                self.assertEqual(op["state"], "failed")
+                await self.reboot()
+                await self.manager.tick()
+                self.assertEqual((await self.store.get(task["uuid"]))["phase"], "done")
+                self.assertEqual(self.bot.count(method), calls + 1)
+                self.assertIsNone(
+                    await self.store.operation(task["uuid"], "private_result")
+                )
+
+    async def test_deactivated_during_membership_lookup_closes_before_settlement(self):
+        task = await self.new_task(advanced=False)
+        self.clock.now = task["deadline"]
+        self.bot.failures["get_chat_member"] = [
+            APIError(403, "Forbidden: user is deactivated")
+        ]
+        await self.manager.tick()
+        self.assertEqual((await self.store.get(task["uuid"]))["phase"], "cleanup")
+        self.assertEqual(self.bot.count("stop_poll"), 0)
+        self.assertEqual(self.bot.count("approve_chat_join_request"), 0)
+
+    async def test_deactivated_during_uncertain_approval_reconciliation_closes(self):
+        task = await self.new_task()
+        await self.store.decide(
+            task["uuid"], dict(action="approve", admin_id=9), self.clock(), manual=True
+        )
+        self.bot.failures["approve_chat_join_request"] = [TimeoutError()]
+        self.bot.failures["get_chat_member"] = [APIError(400, "INPUT_USER_DEACTIVATED")]
+        await self.manager.tick()
+        self.assertEqual((await self.store.get(task["uuid"]))["phase"], "cleanup")
+        self.assertIsNone(
+            (await self.db.get_join_request_status_by_uuid(task["uuid"]))["result"]
+        )
+
+    async def test_saved_deactivation_error_recovers_without_another_api_call(self):
+        task = await self.new_task()
+        await self.store.decide(
+            task["uuid"],
+            dict(action="reject", admin_id=9, generation=20860715),
+            self.clock(),
+            manual=True,
+        )
+        name = "apply_20860715"
+        await self.store.save_operation(
+            task["uuid"],
+            name,
+            dict(
+                version=1,
+                state="pending",
+                attempts=0,
+                next_at=self.clock() + 100,
+                method="decline_chat_join_request",
+                policy="approval",
+                params=dict(chat_id=task["group_id"], user_id=task["user_id"]),
+                error="ApiTelegramException: 403 Forbidden: user is deactivated",
+            ),
+        )
+        await self.store.attention(
+            task["uuid"],
+            f"{name}: ApiTelegramException: 403 Forbidden: user is deactivated",
+            self.clock(),
+        )
+        await self.reboot()
+        await self.manager.tick()
+        await self.manager.tick()
+        self.assertEqual((await self.store.get(task["uuid"]))["phase"], "done")
+        self.assertEqual(self.bot.count("decline_chat_join_request"), 0)
+        self.assertEqual(self.bot.count("get_chat_member"), 0)
+
+    async def test_deactivation_proof_survives_failure_to_commit_closure(self):
+        task = await self.new_task()
+        await self.store.decide(
+            task["uuid"], dict(action="approve", admin_id=9), self.clock(), manual=True
+        )
+        self.bot.failures["approve_chat_join_request"] = [
+            APIError(403, "Forbidden: user is deactivated")
+        ]
+        with patch.object(
+            self.store, "_save", side_effect=RuntimeError("database failure")
+        ):
+            with self.assertRaises(RuntimeError):
+                await self.manager.tick()
+        self.assertTrue(
+            (await self.db.get_join_request_status_by_uuid(task["uuid"]))["waiting"]
+        )
+        await self.reboot()
+        await self.manager.tick()
+        self.assertFalse(
+            (await self.db.get_join_request_status_by_uuid(task["uuid"]))["waiting"]
+        )
+        self.assertEqual(self.bot.count("approve_chat_join_request"), 1)
+
+    async def test_unrelated_forbidden_errors_are_not_account_deactivation(self):
+        task = await self.new_task()
+        await self.store.decide(
+            task["uuid"], dict(action="approve", admin_id=9), self.clock(), manual=True
+        )
+        self.bot.failures["approve_chat_join_request"] = [
+            APIError(403, "Forbidden: bot was blocked by the user")
+        ]
+        await self.manager.tick()
+        await self.reboot()
+        await self.manager.tick()
+        self.assertEqual(
+            (await self.store.get(task["uuid"]))["phase"], "needs_attention"
+        )
+        self.assertTrue(
+            (await self.db.get_join_request_status_by_uuid(task["uuid"]))["waiting"]
+        )
+
+    async def test_deactivated_notification_does_not_reverse_confirmed_approval(self):
+        task = await self.new_task()
+        await self.manager.tick()
+        await self.store.decide(
+            task["uuid"], dict(action="approve", admin_id=9), self.clock(), manual=True
+        )
+        await self.manager.tick()
+        original = self.bot.send_message
+
+        async def send(**params):
+            if params["chat_id"] == task["user_chat_id"]:
+                raise APIError(403, "Forbidden: user is deactivated")
+            return await original(**params)
+
+        with patch.object(self.bot, "send_message", side_effect=send):
+            await self.manager.tick()
+        self.assertEqual((await self.store.get(task["uuid"]))["phase"], "done")
+        self.assertIs(
+            (await self.db.get_join_request_status_by_uuid(task["uuid"]))["result"],
+            True,
+        )
+
     async def test_external_join_replayed_after_restart_closes_vote(self):
         task = await self.new_task(advanced=False)
         update = dict(

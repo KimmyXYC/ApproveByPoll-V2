@@ -22,6 +22,50 @@ def error_summary(error):
     return f"{type(error).__name__}: {code or 'transport'} {description}"[:500]
 
 
+def user_deactivated(code, description):
+    if code not in {400, 403}:
+        return False
+    description = str(description).strip().lower()
+    for prefix in ("bad request: ", "forbidden: "):
+        description = description.removeprefix(prefix)
+    return description in {
+        "user is deactivated",
+        "input_user_deactivated",
+        "user_deactivated",
+    }
+
+
+def targets_applicant(task, op):
+    params = op.get("params", {})
+    return (
+        op.get("method")
+        in {
+            "approve_chat_join_request",
+            "decline_chat_join_request",
+            "ban_chat_member",
+            "get_chat_member",
+        }
+        and params.get("chat_id") == task["group_id"]
+        and params.get("user_id") == task["user_id"]
+    )
+
+
+def saved_deactivation(task, op):
+    if (
+        not op
+        or not targets_applicant(task, op)
+        or op["state"] in {"success", "skipped"}
+    ):
+        return False
+    if op.get("terminal_reason") == "user_deactivated":
+        return True
+    # Older versions stored only this sanitized summary, including the 403
+    # misclassified as a permissions failure. Require an exact API error match.
+    _, _, summary = (op.get("error") or "").partition(": ")
+    code, _, description = summary.partition(" ")
+    return code in {"400", "403"} and user_deactivated(int(code), description)
+
+
 def poll_snapshot(poll):
     return dict(
         closed=bool(poll.is_closed),
@@ -63,11 +107,39 @@ class OperationRunner:
         )
         raise Deferred
 
+    async def close_deactivated(self, task, name, op, error=None):
+        op.update(state="failed", terminal_reason="user_deactivated", next_at=0)
+        if error is not None:
+            op["error"] = error_summary(error)
+        # Persist proof first. If the following transaction fails, recovery can
+        # finish closing without calling Telegram or claiming approval success.
+        await self.store.save_operation(task["uuid"], name, op)
+        await self.store.finish_external(
+            task["uuid"], "closed", "user_deactivated", self.clock()
+        )
+        logger.info("Closed request for deactivated applicant uuid={}", task["uuid"])
+        raise Deferred
+
+    async def recover_deactivated(self, task):
+        if task.get("applied"):
+            return
+        names = ["member_before_settle"]
+        if task.get("decision"):
+            names.append("apply_" + str(task["decision"].get("generation", 0)))
+        for name in names:
+            op = await self.store.operation(task["uuid"], name)
+            if saved_deactivation(task, op):
+                await self.close_deactivated(task, name, op)
+
     async def reconcile(self, task, name, op):
         """Only confirm a verifiable desired state, never infer a rejection."""
         try:
             member = await self.bot.get_chat_member(task["group_id"], task["user_id"])
         except Exception as error:
+            if user_deactivated(
+                getattr(error, "error_code", None), getattr(error, "description", "")
+            ):
+                await self.close_deactivated(task, name, op, error)
             await self.retry(task, name, op, error, unknown=True)
         action = op["method"]
         if action in {"approve_chat_join_request", "decline_chat_join_request"} and (
@@ -126,6 +198,8 @@ class OperationRunner:
                 policy=policy,
             )
             await self.store.save_operation(task["uuid"], name, op)
+        if saved_deactivation(task, op):
+            await self.close_deactivated(task, name, op)
         if op["state"] == "success":
             return op.get("result")
         if op["state"] == "skipped":
@@ -152,6 +226,8 @@ class OperationRunner:
         except Exception as error:
             code = getattr(error, "error_code", None)
             description = str(getattr(error, "description", "")).lower()
+            if targets_applicant(task, op) and user_deactivated(code, description):
+                await self.close_deactivated(task, name, op, error)
             if code == 429:
                 await self.retry(task, name, op, error)
             if code == 400 and (

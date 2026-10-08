@@ -1,4 +1,7 @@
 MESSAGES = {
+    "jr_status_deactivated_label": "Аккаунт удалён; заявка закрыта",
+    "jr_status_user_deactivated": "{user} (ID: {user_id}): аккаунт удалён; заявка закрыта.",
+    "jr_user_deactivated_notice": "Аккаунт Telegram заявителя удалён. Голосование завершено, заявка закрыта.",
     "setting_vote_duration_days": "{days} дн.",
     "setting_vote_duration_hours": "{hours} ч",
     "jr_status_closed_label": "Закрыта (обработана вне бота или отозвана)",

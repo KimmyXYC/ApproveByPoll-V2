@@ -1,4 +1,7 @@
 MESSAGES = {
+    "jr_status_deactivated_label": "Compte désactivé ; demande clôturée",
+    "jr_status_user_deactivated": "{user} (ID: {user_id}) : compte désactivé ; demande clôturée.",
+    "jr_user_deactivated_notice": "Le compte Telegram de la personne est désactivé. Le vote et la demande sont terminés.",
     "setting_vote_duration_days": "{days} j",
     "setting_vote_duration_hours": "{hours} h",
     "jr_status_closed_label": "Terminée (traitée ailleurs ou retirée)",
